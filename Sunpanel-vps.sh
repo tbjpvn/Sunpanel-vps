@@ -21,6 +21,7 @@ NET="sunpanel-net"
 DATA_DIR="${SUNPANEL_DIR:-/opt/sun-panel}"
 STATE_FILE="$DATA_DIR/.sunpanel-vps.env"
 TOKEN_FILE="$DATA_DIR/.cf-tunnel.env"       # 仅 root 可读，保存 TUNNEL_TOKEN
+LEGACY_CRON="${SUNPANEL_CRON_FILE:-/etc/cron.d/sunpanel-renew}"   # 旧版（Caddy 续期版）遗留
 ROLLBACK_TAG="sun-panel-rollback:prev"
 CPORT=3002            # 容器内部端口（程序默认值，不要改）
 DEFAULT_PORT=3002     # 对外端口默认值（只是官方示例，可随意改）
@@ -380,8 +381,7 @@ do_upgrade() {
     run_panel "$IMAGE"
     if wait_up 40; then
         ok "升级成功"
-        docker rmi "$ROLLBACK_TAG" >/dev/null 2>&1
-        docker image prune -f >/dev/null 2>&1
+        docker rmi "$ROLLBACK_TAG" >/dev/null 2>&1   # 只删自己的旧镜像标签，不动系统里其他镜像
     else
         warn "新版本启动后没有响应，回滚到旧镜像 ..."
         run_panel "$ROLLBACK_TAG"
@@ -395,23 +395,69 @@ do_upgrade() {
 }
 
 # ---------------------------------------------------------------------
-# 3. 卸载（自动关闭防火墙端口，只清理本脚本创建的东西）
+# 3. 卸载（两种方式；自动关闭防火墙端口；只清理本脚本创建的东西）
 # ---------------------------------------------------------------------
+legacy_cleanup() {   # 清理旧版脚本（Caddy + 证书续期版）可能留下的东西
+    local line
+    LEGACY_FOUND=0
+    if container_exists sunpanel-caddy; then
+        LEGACY_FOUND=1; docker rm -f sunpanel-caddy >/dev/null 2>&1; ok "已删除旧版遗留的 Caddy 容器"
+    fi
+    if [ -f "$LEGACY_CRON" ]; then
+        LEGACY_FOUND=1; rm -f "$LEGACY_CRON"; ok "已删除旧版遗留的证书续期定时任务"
+    fi
+    if [ -s "$DATA_DIR/.released" ]; then
+        LEGACY_FOUND=1
+        while IFS= read -r line; do
+            case "$line" in
+                systemd:*)
+                    if systemctl start "${line#systemd:}" >/dev/null 2>&1; then ok "已还原被旧版停止的服务 $line"
+                    else warn "还原 $line 失败，请手动启动"; fi ;;
+                docker:*)
+                    if docker start "${line#docker:}" >/dev/null 2>&1; then ok "已还原被旧版停止的容器 $line"
+                    else warn "还原 $line 失败，请手动启动"; fi ;;
+            esac
+        done < "$DATA_DIR/.released"
+        rm -f "$DATA_DIR/.released"
+    fi
+    return 0
+}
+
+wipe_data_dir() {   # 只删本脚本创建的内容，不 rm -rf 整个目录，避免误删别的东西
+    rm -rf "$DATA_DIR/conf" "$DATA_DIR/database" "$DATA_DIR/uploads" \
+           "$DATA_DIR/caddy" "$DATA_DIR/letsencrypt" "$DATA_DIR/sunpanel-vps.sh"
+    rm -f "$STATE_FILE" "$TOKEN_FILE" "$DATA_DIR/.released"
+    if [ -d "$DATA_DIR" ]; then
+        rmdir "$DATA_DIR" 2>/dev/null || warn "$DATA_DIR 里还有不是本脚本创建的文件，已保留该目录"
+    fi
+}
+
 do_uninstall() {
     echo "------------- 卸载 Sun-Panel -------------"
     need_root
     command -v docker >/dev/null 2>&1 || { warn "没有安装 Docker，无需卸载"; return 0; }
     load_state
-    echo "将执行："
-    echo "  - 删除容器 $CNAME 和隧道容器 $TUNNEL_NAME（如果有）、docker 网络 $NET"
-    echo "  - 删除保存的隧道 token"
-    echo "  - 关闭本脚本放行过的防火墙端口：${FW_RULES:-（无）}"
-    echo "  - 可选：删除镜像、删除数据目录 $DATA_DIR"
-    echo "  （不会动你机器上其他的 cloudflared / sing-box）"
-    ask_yn "确认卸载? (y/N):" n || { echo "已取消"; return 0; }
+    local mode a n backups
+    echo "卸载方式："
+    echo "  1) 保留数据：删容器/隧道/网络/防火墙规则，保留 $DATA_DIR 和备份，重装后账号数据还在"
+    echo "  2) 彻底清除：在 1 的基础上，再删镜像、数据目录（账号/导航数据/上传的图标）和脚本生成的所有文件"
+    read -r -p "请选择 [1]（其他键取消）: " mode
+    mode="${mode:-1}"
+    case "$mode" in 1|2) ;; *) echo "已取消"; return 0 ;; esac
 
-    if [ -d "$DATA_DIR" ] && ask_yn "卸载前备份 conf/database/uploads 到 $HOME ? (Y/n):" y; then
-        backup_data
+    echo "两种方式都会："
+    echo "  - 删除容器 $CNAME、隧道容器 $TUNNEL_NAME、docker 网络 $NET、隧道 token"
+    echo "  - 关闭本脚本放行过的防火墙端口：${FW_RULES:-（无）}"
+    echo "  - 清理旧版脚本（Caddy/证书续期版）的遗留，并还原当时被停止的服务"
+    echo "  （不会动你机器上其他的 cloudflared / sing-box / docker 镜像）"
+    if [ "$mode" = "2" ]; then
+        warn "彻底清除后，面板里的账号、导航数据、上传的图标都无法恢复！"
+        read -r -p "确认请输入 yes: " a
+        [ "$a" = "yes" ] || { echo "已取消"; return 0; }
+        if [ -d "$DATA_DIR" ] && ask_yn "清除前先备份一份数据到 $HOME ? (y/N):" n; then backup_data; fi
+    else
+        ask_yn "确认卸载? (y/N):" n || { echo "已取消"; return 0; }
+        if [ -d "$DATA_DIR" ] && ask_yn "卸载前再备份一份到 $HOME ? (y/N):" n; then backup_data; fi
     fi
 
     docker rm -f "$CNAME" "$TUNNEL_NAME" >/dev/null 2>&1
@@ -421,19 +467,34 @@ do_uninstall() {
     ok "容器、网络、隧道 token 已清理"
 
     fw_close_all
+    legacy_cleanup
 
-    if ask_yn "同时删除镜像（$IMAGE / $TUNNEL_IMAGE）? (y/N):" n; then
-        docker rmi "$IMAGE" "$TUNNEL_IMAGE" >/dev/null 2>&1
-        ok "镜像已删除"
-    fi
-    if ask_yn "同时删除数据目录 $DATA_DIR（账号、数据库、上传文件都会没）? (y/N):" n; then
-        rm -rf "$DATA_DIR"
-        ok "数据目录已删除"
+    if [ "$mode" = "2" ]; then
+        docker rmi "$IMAGE" "$TUNNEL_IMAGE" >/dev/null 2>&1   # 被别的容器占用的会自动跳过
+        [ "${LEGACY_FOUND:-0}" = "1" ] && docker rmi caddy:2 certbot/certbot >/dev/null 2>&1
+        ok "镜像已清理（仍被其他容器使用的会保留）"
+        wipe_data_dir
+        ok "数据目录已清除"
+        backups="$(ls "$HOME"/sun-panel-backup-*.tar.gz 2>/dev/null)"
+        if [ -n "$backups" ]; then
+            n="$(echo "$backups" | wc -l | tr -d ' ')"
+            echo "$HOME 下还有 $n 个本脚本生成的备份："
+            echo "$backups" | sed 's/^/    /'
+            if ask_yn "同时删除这些备份? 删除后无法恢复 (y/N):" n; then
+                rm -f "$HOME"/sun-panel-backup-*.tar.gz
+                ok "备份已删除"
+            else
+                echo "备份已保留"
+            fi
+        fi
     else
         DOMAIN=""; save_state
-        echo "数据目录保留在 $DATA_DIR，重新安装后会继续使用"
+        echo "数据目录保留在 $DATA_DIR；备份文件在 $HOME/sun-panel-backup-*.tar.gz"
     fi
-    echo "别忘了到 Cloudflare 后台删除这条隧道和它的公开主机名/DNS 记录（脚本无法代劳）"
+
+    echo "脚本无法代劳的部分："
+    echo "  - Cloudflare 后台：删除这条隧道，以及它的公开主机名 / DNS 记录"
+    echo "  - Docker 本身不会被卸载（其他服务可能在用）；确认不需要时可用系统包管理器自行卸载"
     ok "卸载完成"
 }
 
@@ -557,12 +618,16 @@ do_tunnel_setup() {
     container_exists "$CNAME" || { warn "请先安装 Sun-Panel"; return 0; }
 
     echo "先在 Cloudflare 后台为面板【新建一条专用隧道】（不要复用 sing-box 的 argo 隧道）："
-    echo "  1. Zero Trust → Networks → Tunnels → Create a tunnel → 选 Cloudflared"
-    echo "  2. 起个名字（如 sunpanel），在“安装连接器”页面找到 token（以 eyJ 开头的一长串），复制下来"
-    echo "  3. 下一步添加公开主机名（Public hostname / Published application routes）："
-    echo "       域名: 你的子域名，如 nav.example.com"
-    echo "       服务: 类型 HTTP，地址填  $CNAME:$CPORT"
-    echo "     （主机名的 DNS 记录通常会自动创建）"
+    echo "  1. 控制台左侧 Networking → Tunnels → Create a tunnel"
+    echo "     （旧版界面在 Zero Trust → Networks → Tunnels）"
+    echo "  2. 填名字（如 sunpanel）→ Create Tunnel，页面会给出一条安装命令，里面有 token（eyJ 开头的一长串）"
+    echo "     只需要复制这条命令（或 token），【不要】在服务器上运行它，粘贴到下面给脚本就行"
+    echo "  3. 脚本连上隧道后，回到该页面点 Continue；或者进入 Tunnels → 点你的隧道 → Routes 标签"
+    echo "     → Add route → Published application，填写："
+    echo "       子域名 + 域名：如 nav.example.com"
+    echo "       Service URL：  http://$CNAME:$CPORT"
+    echo "     （旧版界面：隧道的 Public Hostname 标签 → Add a public hostname，服务类型 HTTP，URL 填 $CNAME:$CPORT）"
+    echo "     DNS 记录没有自动创建的话，手动加一条 CNAME：名称=子域名，目标=<隧道ID>.cfargotunnel.com，开启代理"
     echo
     local raw token h
     read -r -s -p "粘贴隧道 token（输入时不显示，回车取消）: " raw; echo
