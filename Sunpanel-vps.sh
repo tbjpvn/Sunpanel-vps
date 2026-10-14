@@ -23,6 +23,7 @@ STATE_FILE="$DATA_DIR/.sunpanel-vps.env"
 TOKEN_FILE="$DATA_DIR/.cf-tunnel.env"       # 仅 root 可读，保存 TUNNEL_TOKEN
 LEGACY_CRON="${SUNPANEL_CRON_FILE:-/etc/cron.d/sunpanel-renew}"   # 旧版（Caddy 续期版）遗留
 ROLLBACK_TAG="sun-panel-rollback:prev"
+MIRROR="${SUNPANEL_MIRROR:-}"   # 可选：Docker Hub 加速站前缀，如 docker.1ms.run（拉取失败时自动改走它）
 CPORT=3002            # 容器内部端口（程序默认值，不要改）
 DEFAULT_PORT=3002     # 对外端口默认值（只是官方示例，可随意改）
 
@@ -32,8 +33,9 @@ warn() { echo "⚠️  $*"; }
 die()  { echo "❌ $*" >&2; exit 1; }
 
 # 菜单配色：终端里显示亮绿色，重定向/非终端时自动不带颜色
-if [ -t 1 ]; then G=$'\033[1;92m'; R=$'\033[0m'; else G=""; R=""; fi
+if [ -t 1 ]; then G=$'\033[1;92m'; RD=$'\033[1;91m'; R=$'\033[0m'; else G=""; RD=""; R=""; fi
 menu() { echo "${G}$*${R}"; }
+menu_red() { echo "${RD}$*${R}"; }
 
 ask_yn() {  # ask_yn "提示(Y/n)" 默认值(y|n)
     local a
@@ -252,14 +254,32 @@ ask_bind() {   # 设置全局 BIND
 }
 
 ensure_net() {
-    docker network inspect "$NET" >/dev/null 2>&1 || docker network create "$NET" >/dev/null
+    docker network inspect "$NET" >/dev/null 2>&1 && return 0
+    docker network create "$NET" >/dev/null 2>&1 || { warn "创建 docker 网络 $NET 失败"; return 1; }
+}
+
+pull_image() {   # pull_image 镜像  失败自动重试 3 次；设了 SUNPANEL_MIRROR 时再走加速站
+    local img="$1" n=1
+    while [ "$n" -le 3 ]; do
+        docker pull "$img" && return 0
+        [ "$n" -lt 3 ] && { warn "拉取失败，3 秒后重试（第 $n/3 次）..."; sleep 3; }
+        n=$((n + 1))
+    done
+    if [ -n "$MIRROR" ]; then
+        warn "直连失败，改用加速站 $MIRROR ..."
+        if docker pull "$MIRROR/$img"; then
+            docker tag "$MIRROR/$img" "$img" && docker rmi "$MIRROR/$img" >/dev/null 2>&1
+            return 0
+        fi
+    fi
+    return 1
 }
 
 run_panel() {   # run_panel [镜像]  使用全局 PORT / BIND
     local image="${1:-$IMAGE}"
     local -a pub=()
     ensure_net || return 1
-    mkdir -p "$DATA_DIR/conf" "$DATA_DIR/database" "$DATA_DIR/uploads"
+    mkdir -p "$DATA_DIR/conf" "$DATA_DIR/database" "$DATA_DIR/uploads" || { warn "无法创建数据目录 $DATA_DIR"; return 1; }
     docker rm -f "$CNAME" >/dev/null 2>&1
     [ "$BIND" != "none" ] && pub=(-p "${BIND}:${PORT}:${CPORT}")
     docker run -d --name "$CNAME" --restart always --network "$NET" \
@@ -274,20 +294,22 @@ sync_panel_fw() {   # 按当前 BIND 放行/关闭面板端口
     if [ "$BIND" = "0.0.0.0" ]; then fw_open "$PORT/tcp"; else fw_close "$PORT/tcp"; fi
 }
 
-backup_data() {   # 备份到 $HOME，路径放进 BACKUP_FILE
+backup_data() {   # 备份到 ~/sun-panel-backup.tar.gz（只保留最新一份），路径放进 BACKUP_FILE
     BACKUP_FILE=""
     [ -d "$DATA_DIR" ] || return 0
-    local files="" d
+    local files="" d tmp="$HOME/sun-panel-backup.tar.gz.tmp"
     for d in conf database uploads; do
         [ -e "$DATA_DIR/$d" ] && files="$files $d"
     done
     [ -n "$files" ] || return 0
-    BACKUP_FILE="$HOME/sun-panel-backup-$(date +%Y%m%d%H%M%S).tar.gz"
     # shellcheck disable=SC2086
-    if tar -czf "$BACKUP_FILE" -C "$DATA_DIR" $files; then
-        ok "数据已备份: $BACKUP_FILE"
+    if tar -czf "$tmp" -C "$DATA_DIR" $files; then
+        rm -f "$HOME"/sun-panel-backup-*.tar.gz          # 清理旧版脚本留下的带时间戳备份
+        mv -f "$tmp" "$HOME/sun-panel-backup.tar.gz"
+        BACKUP_FILE="$HOME/sun-panel-backup.tar.gz"
+        ok "数据已备份（覆盖旧备份）: $BACKUP_FILE"
     else
-        warn "备份失败"; BACKUP_FILE=""; return 1
+        rm -f "$tmp"; warn "备份失败（旧备份保持不变）"; return 1
     fi
 }
 
@@ -323,7 +345,7 @@ do_install() {
     BIND_DEFAULT=1; ask_bind || die "监听方式无效"
 
     info "拉取镜像 $IMAGE ..."
-    docker pull "$IMAGE" || die "镜像拉取失败（网络问题？可设置 SUNPANEL_IMAGE 使用镜像加速地址）"
+    pull_image "$IMAGE" || die "镜像拉取失败（网络问题？可设置 SUNPANEL_MIRROR=加速站域名 再运行）"
 
     info "启动容器 ..."
     run_panel || die "容器启动失败"
@@ -360,14 +382,16 @@ do_upgrade() {
 
     local old_id new_id created
     old_id="$(docker inspect -f '{{.Image}}' "$CNAME" 2>/dev/null)"
+    [ -n "$old_id" ] || die "读取当前镜像失败，未做任何改动"
 
     info "拉取最新镜像 $IMAGE ..."
-    docker pull "$IMAGE" || die "镜像拉取失败，未做任何改动"
+    pull_image "$IMAGE" || die "镜像拉取失败，未做任何改动（可设置 SUNPANEL_MIRROR=加速站域名 再试）"
     new_id="$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null)"
     created="$(docker image inspect -f '{{.Created}}' "$IMAGE" 2>/dev/null | cut -c1-19)"
 
-    if [ -n "$old_id" ] && [ "$old_id" = "$new_id" ]; then
-        ok "已经是最新镜像（构建时间 $created），无需升级"
+    if [ "$old_id" = "$new_id" ]; then
+        ok "面板已经是最新镜像（构建时间 $created），无需升级"
+        upgrade_tunnel_if_any
         return 0
     fi
 
@@ -375,23 +399,28 @@ do_upgrade() {
     ask_yn "升级? 会先备份数据，失败自动回滚 (y/N):" n || { echo "已取消"; return 0; }
 
     backup_data
-    docker tag "$old_id" "$ROLLBACK_TAG" 2>/dev/null
+    docker tag "$old_id" "$ROLLBACK_TAG" || die "无法给旧镜像打回滚标签，已停止（未做任何改动）"
 
     info "用新镜像重建容器 ..."
-    run_panel "$IMAGE"
-    if wait_up 40; then
+    if run_panel "$IMAGE" && wait_up 40; then
         ok "升级成功"
         docker rmi "$ROLLBACK_TAG" >/dev/null 2>&1   # 只删自己的旧镜像标签，不动系统里其他镜像
+        upgrade_tunnel_if_any
     else
-        warn "新版本启动后没有响应，回滚到旧镜像 ..."
-        run_panel "$ROLLBACK_TAG"
-        if wait_up 30; then
+        warn "新版本启动失败或没有响应，回滚到旧镜像 ..."
+        if run_panel "$ROLLBACK_TAG" && wait_up 30; then
             ok "已回滚，旧版本恢复运行"
         else
             warn "回滚后仍无响应，请用菜单 10 查看日志；数据备份: ${BACKUP_FILE:-无}"
         fi
         return 1
     fi
+}
+
+upgrade_tunnel_if_any() {   # 升级面板时顺带检查 cloudflared 是否有新版
+    container_exists "$TUNNEL_NAME" || return 0
+    ask_yn "检测到 Cloudflare 隧道容器，同时检查并更新 cloudflared? (Y/n):" y || return 0
+    do_tunnel_update
 }
 
 # ---------------------------------------------------------------------
@@ -475,13 +504,13 @@ do_uninstall() {
         ok "镜像已清理（仍被其他容器使用的会保留）"
         wipe_data_dir
         ok "数据目录已清除"
-        backups="$(ls "$HOME"/sun-panel-backup-*.tar.gz 2>/dev/null)"
+        backups="$(ls "$HOME"/sun-panel-backup*.tar.gz 2>/dev/null)"
         if [ -n "$backups" ]; then
             n="$(echo "$backups" | wc -l | tr -d ' ')"
             echo "$HOME 下还有 $n 个本脚本生成的备份："
             echo "$backups" | sed 's/^/    /'
             if ask_yn "同时删除这些备份? 删除后无法恢复 (y/N):" n; then
-                rm -f "$HOME"/sun-panel-backup-*.tar.gz
+                rm -f "$HOME"/sun-panel-backup*.tar.gz
                 ok "备份已删除"
             else
                 echo "备份已保留"
@@ -489,7 +518,7 @@ do_uninstall() {
         fi
     else
         DOMAIN=""; save_state
-        echo "数据目录保留在 $DATA_DIR；备份文件在 $HOME/sun-panel-backup-*.tar.gz"
+        echo "数据目录保留在 $DATA_DIR；备份文件在 $HOME/sun-panel-backup.tar.gz"
     fi
 
     echo "脚本无法代劳的部分："
@@ -653,7 +682,7 @@ do_tunnel_setup() {
     chmod 600 "$TOKEN_FILE"
 
     info "启动隧道容器（首次需要拉取镜像）..."
-    docker pull "$TUNNEL_IMAGE" >/dev/null 2>&1
+    pull_image "$TUNNEL_IMAGE" >/dev/null 2>&1 || warn "拉取 cloudflared 镜像失败，尝试使用本地已有镜像"
     run_tunnel || { warn "隧道容器启动失败"; return 1; }
     if wait_tunnel 40; then
         ok "隧道已连接 Cloudflare"
@@ -682,7 +711,7 @@ do_tunnel_update() {
     container_exists "$TUNNEL_NAME" || { warn "没有配置隧道"; return 0; }
     local old new
     old="$(docker inspect -f '{{.Image}}' "$TUNNEL_NAME" 2>/dev/null)"
-    docker pull "$TUNNEL_IMAGE" >/dev/null 2>&1 || { warn "拉取镜像失败"; return 1; }
+    pull_image "$TUNNEL_IMAGE" >/dev/null 2>&1 || { warn "拉取 cloudflared 镜像失败"; return 1; }
     new="$(docker image inspect -f '{{.Id}}' "$TUNNEL_IMAGE" 2>/dev/null)"
     if [ "$old" = "$new" ]; then ok "cloudflared 已经是最新"; return 0; fi
     run_tunnel || { warn "重建失败"; return 1; }
@@ -759,7 +788,7 @@ while true; do
     menu "=========================================="
     menu "  1) 安装"
     menu "  2) 升级（拉取最新官方镜像，失败自动回滚）"
-    menu "  3) 卸载（自动关闭防火墙端口）"
+    menu_red "  3) 卸载（自动关闭防火墙端口）"
     menu "  4) 查看状态"
     menu "  5) 重启服务"
     menu "  6) 重置管理员密码"
