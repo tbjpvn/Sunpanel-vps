@@ -27,19 +27,22 @@ MIRROR="${SUNPANEL_MIRROR:-}"   # 可选：Docker Hub 加速站前缀，如 dock
 CPORT=3002            # 容器内部端口（程序默认值，不要改）
 DEFAULT_PORT=3002     # 对外端口默认值（只是官方示例，可随意改）
 
-info() { echo "➜ $*"; }
-ok()   { echo "✅ $*"; }
-warn() { echo "⚠️  $*"; }
-die()  { echo "❌ $*" >&2; exit 1; }
+# 配色：终端里显示颜色，重定向/非终端时自动不带颜色
+#   亮绿 = 菜单 / 需要你输入的提示 / 成功     亮黄 = 需要注意     亮红 = 重要警告 / 错误
+if [ -t 1 ]; then G=$'\033[1;92m'; Y=$'\033[1;93m'; RD=$'\033[1;91m'; R=$'\033[0m'; else G=""; Y=""; RD=""; R=""; fi
 
-# 菜单配色：终端里显示亮绿色，重定向/非终端时自动不带颜色
-if [ -t 1 ]; then G=$'\033[1;92m'; RD=$'\033[1;91m'; R=$'\033[0m'; else G=""; RD=""; R=""; fi
+info() { echo "➜ $*"; }
+ok()   { echo "${G}✅ $*${R}"; }
+warn() { echo "${Y}⚠️  $*${R}"; }
+die()  { echo "${RD}❌ $*${R}" >&2; exit 1; }
 menu() { echo "${G}$*${R}"; }
 menu_red() { echo "${RD}$*${R}"; }
+note() { echo "${Y}$*${R}"; }      # 需要注意的说明（黄）
+imp()  { echo "${RD}$*${R}"; }      # 重要警告（红）
 
 ask_yn() {  # ask_yn "提示(Y/n)" 默认值(y|n)
     local a
-    read -r -p "$1 " a
+    read -r -p "${G}$1 ${R}" a
     a="${a:-${2:-n}}"
     case "$a" in y|Y) return 0 ;; *) return 1 ;; esac
 }
@@ -222,7 +225,7 @@ ask_port() {   # 设置全局 PORT
     local p
     echo "（对外端口只是映射到容器内的 $CPORT，$DEFAULT_PORT 是官方示例，不是强制要求，可改成任意未占用端口）"
     while true; do
-        read -r -p "对外端口 [${PORT:-$DEFAULT_PORT}]（输入 r 随机生成 10000 以上的端口）: " p
+        read -r -p "${G}对外端口 [${PORT:-$DEFAULT_PORT}]（输入 r 随机生成 10000 以上的端口）: ${R}" p
         p="${p:-${PORT:-$DEFAULT_PORT}}"
         case "$p" in
             r|R)
@@ -263,7 +266,7 @@ ask_bind() {   # 设置全局 BIND
     echo "  1) 0.0.0.0    所有网卡，可用 http://服务器IP:端口 直接访问"
     echo "  2) 127.0.0.1  仅本机"
     [ "$tunnel_on" -eq 1 ] && echo "  3) 不发布端口  只能通过 Cloudflare 隧道访问（最安全，推荐）"
-    read -r -p "请选择 [${BIND_DEFAULT:-1}]: " s
+    read -r -p "${G}请选择 [${BIND_DEFAULT:-1}]: ${R}" s
     case "${s:-${BIND_DEFAULT:-1}}" in
         1) BIND="0.0.0.0" ;;
         2) BIND="127.0.0.1" ;;
@@ -335,13 +338,13 @@ backup_data() {   # 备份到 ~/sun-panel-backup.tar.gz（只保留最新一份�
 show_access() {
     local ip
     if [ -n "$DOMAIN" ] && container_running "$TUNNEL_NAME"; then
-        echo "访问地址: https://$DOMAIN"
+        echo "${G}访问地址: https://$DOMAIN${R}"
     fi
     case "$BIND" in
         0.0.0.0)
             ip="$(public_ip)"
             echo "直连地址: http://${ip:-服务器IP}:$PORT"
-            echo "   （打不开请检查云厂商安全组是否放行 TCP $PORT；安全组不在服务器上，脚本改不了）" ;;
+            note "   （打不开请检查云厂商安全组是否放行 TCP $PORT；安全组不在服务器上，脚本改不了）" ;;
         127.0.0.1) echo "当前仅监听本机 127.0.0.1:$PORT" ;;
         none)      echo "未发布端口，只能通过 Cloudflare 隧道访问" ;;
     esac
@@ -380,8 +383,8 @@ do_install() {
     echo "=============================================="
     ok "安装完成"
     show_access
-    echo "默认账号: admin@sun.cc   默认密码: 12345678   —— 登录后请立刻修改！"
-    echo "说明：Docker 发布的端口会绕过 ufw/firewalld 的过滤；想真正限制访问，请用隧道 + 不发布端口。"
+    imp "默认账号: admin@sun.cc   默认密码: 12345678   —— 登录后请立刻修改！"
+    note "说明：Docker 发布的端口会绕过 ufw/firewalld 的过滤；想真正限制访问，请用隧道 + 不发布端口。"
     echo "=============================================="
 
     if ask_yn "现在配置 Cloudflare 隧道（用域名访问，不占 80/443）? (y/N):" n; then
@@ -489,18 +492,18 @@ do_uninstall() {
     echo "卸载方式："
     echo "  1) 保留数据：删容器/隧道/网络/防火墙规则，保留 $DATA_DIR 和备份，重装后账号数据还在"
     echo "  2) 彻底清除：在 1 的基础上，再删镜像、数据目录（账号/导航数据/上传的图标）和脚本生成的所有文件"
-    read -r -p "请选择 [1]（其他键取消）: " mode
+    read -r -p "${G}请选择 [1]（其他键取消）: ${R}" mode
     mode="${mode:-1}"
     case "$mode" in 1|2) ;; *) echo "已取消"; return 0 ;; esac
 
-    echo "两种方式都会："
+    note "两种方式都会："
     echo "  - 删除容器 $CNAME、隧道容器 $TUNNEL_NAME、docker 网络 $NET、隧道 token"
     echo "  - 关闭本脚本放行过的防火墙端口：${FW_RULES:-（无）}"
     echo "  - 清理旧版脚本（Caddy/证书续期版）的遗留，并还原当时被停止的服务"
     echo "  （不会动你机器上其他的 cloudflared / sing-box / docker 镜像）"
     if [ "$mode" = "2" ]; then
         warn "彻底清除后，面板里的账号、导航数据、上传的图标都无法恢复！"
-        read -r -p "确认请输入 yes: " a
+        read -r -p "${G}确认请输入 yes: ${R}" a
         [ "$a" = "yes" ] || { echo "已取消"; return 0; }
         if [ -d "$DATA_DIR" ] && ask_yn "清除前先备份一份数据到 $HOME ? (y/N):" n; then backup_data; fi
     else
@@ -540,7 +543,7 @@ do_uninstall() {
         echo "数据目录保留在 $DATA_DIR；备份文件在 $HOME/sun-panel-backup.tar.gz"
     fi
 
-    echo "脚本无法代劳的部分："
+    note "脚本无法代劳的部分："
     echo "  - Cloudflare 后台：删除这条隧道，以及它的公开主机名 / DNS 记录"
     echo "  - Docker 本身不会被卸载（其他服务可能在用）；确认不需要时可用系统包管理器自行卸载"
     ok "卸载完成"
@@ -679,18 +682,18 @@ do_tunnel_setup() {
     echo "  1. 控制台左侧 Networking → Tunnels → Create a tunnel"
     echo "     （旧版界面在 Zero Trust → Networks → Tunnels）"
     echo "  2. 填名字（如 sunpanel）→ Create Tunnel，页面会给出一条安装命令，里面有 token（eyJ 开头的一长串）"
-    echo "     只需要复制这条命令（或 token），【不要】在服务器上运行它，粘贴到下面给脚本就行"
+    imp "     只需要复制这条命令（或 token），【不要】在服务器上运行它，粘贴到下面给脚本就行"
     echo "  3. 脚本连上隧道后，回到该页面点 Continue；或者进入 Tunnels → 点你的隧道 → Routes 标签"
     echo "     → Add route → Published application，填写："
     echo "       子域名 + 域名：如 nav.example.com"
     echo "       Service URL：  http://$CNAME:$CPORT"
     echo "     （旧版界面：隧道的 Public Hostname 标签 → Add a public hostname，服务类型 HTTP，URL 填 $CNAME:$CPORT）"
     echo "     DNS 记录没有自动创建的话，手动加一条 CNAME：名称=子域名，目标=<隧道ID>.cfargotunnel.com，开启代理"
-    echo "  ※ 纯 IPv6 / NAT64 的机器（容器连不上 Cloudflare）：下面会问是否用“宿主机网络模式”，"
-    echo "    选了之后 Service URL 要改填 http://127.0.0.1:面板端口（脚本会在最后提示具体地址）"
+    note "  ※ 纯 IPv6 / NAT64 的机器（容器连不上 Cloudflare）：下面会问是否用“宿主机网络模式”，"
+    note "    选了之后 Service URL 要改填 http://127.0.0.1:面板端口（脚本会在最后提示具体地址）"
     echo
     local raw token h
-    read -r -p "粘贴隧道 token（回车取消）: " raw
+    read -r -p "${G}粘贴隧道 token（回车取消）: ${R}" raw
     [ -n "$raw" ] || { echo "已取消"; return 0; }
     token="$(parse_token "$raw")"
     case "$token" in
@@ -705,7 +708,7 @@ do_tunnel_setup() {
         TUNNEL_HOST=0
     fi
 
-    read -r -p "你在后台设置的公开主机名（如 nav.example.com，用于显示和自检，可留空）: " h
+    read -r -p "${G}你在后台设置的公开主机名（如 nav.example.com，用于显示和自检，可留空）: ${R}" h
     if [ -n "$h" ]; then
         case "$h" in
             *[!A-Za-z0-9.-]*|.*|*..*|-*|*.) warn "域名格式不对，已忽略"; h="" ;;
@@ -726,8 +729,8 @@ do_tunnel_setup() {
     else
         warn "40 秒内没有看到连接成功。最近日志："
         docker logs --tail 15 "$TUNNEL_NAME" 2>&1 | sed 's/^/    /'
-        echo "    常见原因：token 复制不完整 / 服务器连不上 Cloudflare（出站 7844 端口被限制）"
-        echo "    若日志里 precheck 的 TCP 443 / api.cloudflare.com 也失败，说明是【容器出网】有问题（DNS / 转发 / NAT），不是 token 的事："
+        note "    常见原因：token 复制不完整 / 服务器连不上 Cloudflare（出站 7844 端口被限制）"
+        note "    若日志里 precheck 的 TCP 443 / api.cloudflare.com 也失败，说明是【容器出网】有问题（DNS / 转发 / NAT），不是 token 的事："
         echo "      docker run --rm --network $NET busybox nslookup api.cloudflare.com"
         echo "      docker run --rm --network $NET busybox wget -T 8 -qO- https://api.cloudflare.com/cdn-cgi/trace"
     fi
@@ -744,7 +747,7 @@ do_tunnel_setup() {
             sync_panel_fw
             wait_up 30 && ok "已生效" || warn "没有响应，请查看日志"
         fi
-        echo "★ Cloudflare 后台该隧道的 Service URL 请填：http://127.0.0.1:$PORT"
+        imp "★ Cloudflare 后台该隧道的 Service URL 请填：http://127.0.0.1:$PORT"
     elif [ "$BIND" != "none" ] && ask_yn "关闭面板的公网直连端口 $PORT，只通过隧道访问（推荐）? (Y/n):" y; then
         BIND="none"
         run_panel || die "容器重建失败"
@@ -788,7 +791,7 @@ do_tunnel_remove() {
     save_state
     sync_panel_fw
     ok "隧道已移除；面板现在监听 $BIND:$PORT"
-    echo "别忘了到 Cloudflare 后台删除这条隧道（脚本无法代劳）"
+    note "别忘了到 Cloudflare 后台删除这条隧道（脚本无法代劳）"
 }
 
 do_tunnel() {
@@ -798,7 +801,7 @@ do_tunnel() {
     echo "  1) 配置 / 更换隧道 token"
     echo "  2) 更新 cloudflared 镜像"
     echo "  3) 移除隧道"
-    read -r -p "请选择 [1]: " c
+    read -r -p "${G}请选择 [1]: ${R}" c
     case "${c:-1}" in
         1) do_tunnel_setup ;;
         2) do_tunnel_update ;;
@@ -821,7 +824,7 @@ do_logs() {
     local t
     echo "  1) Sun-Panel 日志"
     echo "  2) Cloudflare 隧道日志"
-    read -r -p "请选择 [1]: " t
+    read -r -p "${G}请选择 [1]: ${R}" t
     case "${t:-1}" in
         1) docker logs --tail 50 "$CNAME" 2>&1 ;;
         2) docker logs --tail 50 "$TUNNEL_NAME" 2>&1 ;;
