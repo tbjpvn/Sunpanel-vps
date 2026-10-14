@@ -222,8 +222,19 @@ ask_port() {   # 设置全局 PORT
     local p
     echo "（对外端口只是映射到容器内的 $CPORT，$DEFAULT_PORT 是官方示例，不是强制要求，可改成任意未占用端口）"
     while true; do
-        read -r -p "对外端口 [${PORT:-$DEFAULT_PORT}]: " p
+        read -r -p "对外端口 [${PORT:-$DEFAULT_PORT}]（输入 r 随机生成 10000 以上的端口）: " p
         p="${p:-${PORT:-$DEFAULT_PORT}}"
+        case "$p" in
+            r|R)
+                local tries=0
+                while [ "$tries" -lt 50 ]; do
+                    p=$(( 10000 + (RANDOM * 32768 + RANDOM) % 55536 ))   # 10000-65535
+                    port_in_use "$p" || break
+                    tries=$((tries + 1))
+                done
+                if port_in_use "$p"; then warn "没找到空闲的随机端口，请手动输入"; continue; fi
+                info "已随机选择端口 $p" ;;
+        esac
         case "$p" in ''|*[!0-9]*) warn "端口必须是数字"; continue ;; esac
         if [ "$p" -lt 1 ] || [ "$p" -gt 65535 ]; then
             warn "端口范围应为 1-65535"; continue
@@ -240,6 +251,12 @@ ask_port() {   # 设置全局 PORT
 
 ask_bind() {   # 设置全局 BIND
     local s tunnel_on=0
+    if [ "${TUNNEL_HOST:-0}" = "1" ]; then
+        # 宿主机网络模式：隧道只能经 127.0.0.1 回源，0.0.0.0 / 不发布 都不适用，直接固定
+        BIND="127.0.0.1"
+        info "隧道使用宿主机网络模式，监听方式固定为 127.0.0.1（仅本机，外网只能走隧道）"
+        return 0
+    fi
     container_running "$TUNNEL_NAME" && tunnel_on=1
     [ "${TUNNEL_HOST:-0}" = "1" ] && tunnel_on=0   # 宿主机网络模式的隧道要靠 127.0.0.1 端口回源，不能选“不发布端口”
     echo "监听方式："
