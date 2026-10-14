@@ -23,6 +23,8 @@ STATE_FILE="$DATA_DIR/.sunpanel-vps.env"
 TOKEN_FILE="$DATA_DIR/.cf-tunnel.env"       # 仅 root 可读，保存 TUNNEL_TOKEN
 LEGACY_CRON="${SUNPANEL_CRON_FILE:-/etc/cron.d/sunpanel-renew}"   # 旧版（Caddy 续期版）遗留
 ROLLBACK_TAG="sun-panel-rollback:prev"
+SP_BIN="${SUNPANEL_SHORTCUT:-/usr/local/bin/sp}"   # 快捷命令：输入 sp 打开主菜单
+SP_MARK="sunpanel-vps-shortcut-v1"                  # 用来识别这个 sp 是本脚本装的，不会误覆盖别人的命令
 MIRROR="${SUNPANEL_MIRROR:-}"   # 可选：Docker Hub 加速站前缀，如 docker.1ms.run（拉取失败时自动改走它）
 CPORT=3002            # 容器内部端口（程序默认值，不要改）
 DEFAULT_PORT=3002     # 对外端口默认值（只是官方示例，可随意改）
@@ -526,6 +528,7 @@ do_uninstall() {
         ok "镜像已清理（仍被其他容器使用的会保留）"
         wipe_data_dir
         ok "数据目录已清除"
+        remove_shortcut
         backups="$(ls "$HOME"/sun-panel-backup*.tar.gz 2>/dev/null)"
         if [ -n "$backups" ]; then
             n="$(echo "$backups" | wc -l | tr -d ' ')"
@@ -833,8 +836,37 @@ do_logs() {
 }
 
 # ---------------------------------------------------------------------
+# 快捷命令 sp：把本脚本复制到 /usr/local/bin/sp，以后直接输入 sp 就能调出主菜单
+#   - 需要 root 且本脚本是以文件方式运行（bash 脚本文件）；用 bash <(curl ...) 方式运行时无法安装
+#   - 已存在的、不是本脚本装的 sp 不会被覆盖；脚本更新后再运行一次会自动同步
+# ---------------------------------------------------------------------
+install_shortcut() {
+    [ "$(id -u)" -eq 0 ] || return 0
+    local self="${BASH_SOURCE[0]:-$0}"
+    [ -f "$self" ] && [ -r "$self" ] || return 0
+    if [ -e "$SP_BIN" ] && ! grep -q "$SP_MARK" "$SP_BIN" 2>/dev/null; then
+        warn "$SP_BIN 已存在且不是本脚本安装的，跳过快捷命令 sp"
+        return 0
+    fi
+    [ -e "$SP_BIN" ] && cmp -s "$self" "$SP_BIN" && return 0
+    mkdir -p "$(dirname "$SP_BIN")" 2>/dev/null
+    if cp -f "$self" "$SP_BIN" 2>/dev/null && chmod 755 "$SP_BIN"; then
+        ok "已安装快捷命令：以后在终端输入 sp 即可打开本菜单"
+    else
+        warn "快捷命令安装失败（不影响使用）"
+    fi
+}
+
+remove_shortcut() {
+    [ -e "$SP_BIN" ] && grep -q "$SP_MARK" "$SP_BIN" 2>/dev/null && rm -f "$SP_BIN" && ok "已删除快捷命令 sp"
+    return 0
+}
+
+# ---------------------------------------------------------------------
 # 菜单
 # ---------------------------------------------------------------------
+install_shortcut
+
 while true; do
     echo
     menu "=========================================="
@@ -851,6 +883,7 @@ while true; do
     menu "  9) 备份数据"
     menu " 10) 查看日志"
     menu "  0) 退出"
+    [ -e "$SP_BIN" ] && note "  （快捷命令：在终端输入 sp 随时打开本菜单）"
     read -r -p "${G}请选择 [0-10]: ${R}" choice
     case "$choice" in
         1) ( do_install ) ;;
