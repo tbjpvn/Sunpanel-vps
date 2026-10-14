@@ -836,6 +836,74 @@ do_logs() {
 }
 
 # ---------------------------------------------------------------------
+# 面板容器出网（纯 IPv6 / NAT64 机器）：
+#   这类机器的 IPv4 出不去，容器里的面板就没法“在线更新 / 在线图标”等所有联网功能。
+#   做法：给 docker 网络开 IPv6（ULA 子网 + NAT66 伪装），让容器走宿主机的 IPv6 出网；
+#   宿主机的 DNS64（如 nat64.net）会把只有 IPv4 的站点解析成可达的 IPv6 地址。
+# ---------------------------------------------------------------------
+IPV6_SYSCTL="/etc/sysctl.d/99-sunpanel-ipv6.conf"
+IPV6_SUBNET="fd7a:5e6c:3b1d::/64"
+
+net_probe() {   # 在 sunpanel-net 里临时起一个容器测 IPv6 出网，成功返回 0
+    docker run --rm --network "$NET" busybox wget -T 8 -qO- "http://[2606:4700:4700::1111]/cdn-cgi/trace" 2>/dev/null | grep -q '^ip='
+}
+
+do_ipv6_net() {
+    need_root; ensure_docker
+    command -v ip6tables >/dev/null 2>&1 || die "没有 ip6tables，Docker 的 IPv6 NAT 需要它（apt install iptables）"
+    info "先检查宿主机自身的 IPv6 出网 ..."
+    curl -6 -m 8 -fsS "https://api.cloudflare.com/cdn-cgi/trace" >/dev/null 2>&1 || die "宿主机 IPv6 出网不通，这个方案用不了"
+    ok "宿主机 IPv6 正常"
+
+    local iface
+    iface=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n1)
+    [ -n "$iface" ] || die "找不到 IPv6 出口网卡"
+
+    note "将要做的事："
+    note "  1) 对网卡 $iface 设置 accept_ra=2，再开启 IPv6 转发（并写入 $IPV6_SYSCTL 持久化）"
+    note "     —— 开转发后内核默认会不再接收路由通告，可能丢掉默认 IPv6 路由导致断连，accept_ra=2 就是防这个的"
+    note "  2) 重建 docker 网络 $NET（开启 IPv6，子网 $IPV6_SUBNET）"
+    note "  3) 重建面板容器（数据在 $DATA_DIR，不受影响）；隧道若是容器网络模式也会重建"
+    imp  "  改网络有断连风险，建议确认能从云厂商控制台（VNC / 救援）进入服务器后再继续"
+    ask_yn "继续? (y/N):" n || { info "已取消"; return 0; }
+
+    local old_fwd old_ra
+    old_fwd=$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo 0)
+    old_ra=$(sysctl -n "net.ipv6.conf.$iface.accept_ra" 2>/dev/null || echo 1)
+    sysctl -w "net.ipv6.conf.$iface.accept_ra=2" >/dev/null
+    sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
+    printf 'net.ipv6.conf.%s.accept_ra=2\nnet.ipv6.conf.all.forwarding=1\n' "$iface" > "$IPV6_SYSCTL"
+    sleep 2
+    if ! ip -6 route show default 2>/dev/null | grep -q . || ! curl -6 -m 8 -fsS "https://api.cloudflare.com/cdn-cgi/trace" >/dev/null 2>&1; then
+        warn "开启转发后宿主机 IPv6 出网异常，正在回滚设置"
+        sysctl -w net.ipv6.conf.all.forwarding="$old_fwd" >/dev/null
+        sysctl -w "net.ipv6.conf.$iface.accept_ra=$old_ra" >/dev/null
+        rm -f "$IPV6_SYSCTL"
+        die "已回滚，没有改动 docker 网络"
+    fi
+    ok "IPv6 转发已开启，宿主机 IPv6 仍正常"
+
+    docker rm -f "$CNAME" >/dev/null 2>&1
+    docker rm -f "$TUNNEL_NAME" >/dev/null 2>&1
+    docker network rm "$NET" >/dev/null 2>&1
+    if ! docker network create --ipv6 --subnet "$IPV6_SUBNET" "$NET" >/dev/null 2>&1; then
+        warn "创建 IPv6 网络失败（Docker 版本过旧或 ip6tables 不可用），恢复为普通网络"
+        ensure_net; run_panel; [ -f "$TOKEN_FILE" ] && run_tunnel
+        die "已恢复原状"
+    fi
+    run_panel || die "面板容器重建失败"
+    [ -f "$TOKEN_FILE" ] && { run_tunnel || warn "隧道容器重建失败，请到菜单 8 处理"; }
+    wait_up 30 && ok "面板已重新启动" || warn "面板暂时没有响应，请查看日志"
+
+    info "测试容器 IPv6 出网 ..."
+    if net_probe; then
+        ok "面板容器已经能出网了，现在可以试试在线更新 / 在线图标"
+    else
+        warn "容器 IPv6 出网测试没通过。可查看：docker network inspect $NET ；ip6tables -t nat -S POSTROUTING"
+    fi
+}
+
+# ---------------------------------------------------------------------
 # 快捷命令 sp：把本脚本复制到 /usr/local/bin/sp，以后直接输入 sp 就能调出主菜单
 #   - 需要 root 且本脚本是以文件方式运行（bash 脚本文件）；用 bash <(curl ...) 方式运行时无法安装
 #   - 已存在的、不是本脚本装的 sp 不会被覆盖；脚本更新后再运行一次会自动同步
@@ -882,9 +950,10 @@ while true; do
     menu "  8) Cloudflare 隧道（配置 / 更新 / 移除）"
     menu "  9) 备份数据"
     menu " 10) 查看日志"
+    menu " 11) 让面板能联网（纯 IPv6 / NAT64 机器：在线更新、在线图标）"
     menu "  0) 退出"
     [ -e "$SP_BIN" ] && note "  （快捷命令：在终端输入 sp 随时打开本菜单）"
-    read -r -p "${G}请选择 [0-10]: ${R}" choice
+    read -r -p "${G}请选择 [0-11]: ${R}" choice
     case "$choice" in
         1) ( do_install ) ;;
         2) ( do_upgrade ) ;;
@@ -896,6 +965,7 @@ while true; do
         8) ( do_tunnel ) ;;
         9) ( do_backup ) ;;
         10) ( do_logs ) ;;
+        11) ( do_ipv6_net ) ;;
         0) echo "Bye."; exit 0 ;;
         *) warn "无效选项" ;;
     esac
