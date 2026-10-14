@@ -659,7 +659,7 @@ do_tunnel_setup() {
     echo "     DNS 记录没有自动创建的话，手动加一条 CNAME：名称=子域名，目标=<隧道ID>.cfargotunnel.com，开启代理"
     echo
     local raw token h
-    read -r -s -p "粘贴隧道 token（输入时不显示，回车取消）: " raw; echo
+    read -r -p "粘贴隧道 token（回车取消）: " raw
     [ -n "$raw" ] || { echo "已取消"; return 0; }
     token="$(parse_token "$raw")"
     case "$token" in
@@ -690,6 +690,9 @@ do_tunnel_setup() {
         warn "40 秒内没有看到连接成功。最近日志："
         docker logs --tail 15 "$TUNNEL_NAME" 2>&1 | sed 's/^/    /'
         echo "    常见原因：token 复制不完整 / 服务器连不上 Cloudflare（出站 7844 端口被限制）"
+        echo "    若日志里 precheck 的 TCP 443 / api.cloudflare.com 也失败，说明是【容器出网】有问题（DNS / 转发 / NAT），不是 token 的事："
+        echo "      docker run --rm --network $NET busybox nslookup api.cloudflare.com"
+        echo "      docker run --rm --network $NET busybox wget -T 8 -qO- https://api.cloudflare.com/cdn-cgi/trace"
     fi
     DOMAIN="$h"
     save_state
