@@ -850,6 +850,7 @@ net_probe() {   # 在 sunpanel-net 里临时起一个容器测 IPv6 出网，成
 
 do_ipv6_net() {
     need_root; ensure_docker
+    load_state   # 读取端口 / 监听方式（run_panel 要用，没有会因 set -u 报 BIND unbound）
     command -v ip6tables >/dev/null 2>&1 || die "没有 ip6tables，Docker 的 IPv6 NAT 需要它（apt install iptables）"
     info "先检查宿主机自身的 IPv6 出网 ..."
     curl -6 -m 8 -fsS "https://api.cloudflare.com/cdn-cgi/trace" >/dev/null 2>&1 || die "宿主机 IPv6 出网不通，这个方案用不了"
