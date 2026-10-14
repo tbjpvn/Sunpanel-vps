@@ -48,7 +48,7 @@ ask_yn() {  # ask_yn "提示(Y/n)" 默认值(y|n)
 # 状态文件
 # ---------------------------------------------------------------------
 load_state() {
-    PORT="$DEFAULT_PORT"; BIND="0.0.0.0"; DOMAIN=""; FW_RULES=""
+    PORT="$DEFAULT_PORT"; BIND="0.0.0.0"; DOMAIN=""; FW_RULES=""; TUNNEL_HOST=0
     # shellcheck disable=SC1090
     [ -f "$STATE_FILE" ] && . "$STATE_FILE"
     return 0
@@ -61,6 +61,7 @@ PORT="$PORT"
 BIND="$BIND"
 DOMAIN="$DOMAIN"
 FW_RULES="$FW_RULES"
+TUNNEL_HOST="$TUNNEL_HOST"
 EOF
 }
 
@@ -240,6 +241,7 @@ ask_port() {   # 设置全局 PORT
 ask_bind() {   # 设置全局 BIND
     local s tunnel_on=0
     container_running "$TUNNEL_NAME" && tunnel_on=1
+    [ "${TUNNEL_HOST:-0}" = "1" ] && tunnel_on=0   # 宿主机网络模式的隧道要靠 127.0.0.1 端口回源，不能选“不发布端口”
     echo "监听方式："
     echo "  1) 0.0.0.0    所有网卡，可用 http://服务器IP:端口 直接访问"
     echo "  2) 127.0.0.1  仅本机"
@@ -248,7 +250,7 @@ ask_bind() {   # 设置全局 BIND
     case "${s:-${BIND_DEFAULT:-1}}" in
         1) BIND="0.0.0.0" ;;
         2) BIND="127.0.0.1" ;;
-        3) [ "$tunnel_on" -eq 1 ] && BIND="none" || { warn "隧道没在运行，不能选 3"; return 1; } ;;
+        3) [ "$tunnel_on" -eq 1 ] && BIND="none" || { warn "隧道没在运行（或隧道用宿主机网络模式，需要发布端口），不能选 3"; return 1; } ;;
         *) warn "无效选择"; return 1 ;;
     esac
 }
@@ -517,7 +519,7 @@ do_uninstall() {
             fi
         fi
     else
-        DOMAIN=""; save_state
+        DOMAIN=""; TUNNEL_HOST=0; save_state
         echo "数据目录保留在 $DATA_DIR；备份文件在 $HOME/sun-panel-backup.tar.gz"
     fi
 
@@ -602,8 +604,14 @@ run_tunnel() {
     [ -f "$TOKEN_FILE" ] || return 1
     ensure_net || return 1
     docker rm -f "$TUNNEL_NAME" >/dev/null 2>&1
-    docker run -d --name "$TUNNEL_NAME" --restart always --network "$NET" \
-        --env-file "$TOKEN_FILE" "$TUNNEL_IMAGE" tunnel --no-autoupdate run >/dev/null
+    if [ "${TUNNEL_HOST:-0}" = "1" ]; then
+        # 宿主机网络 + 强制 IPv6 连边缘：用于纯 IPv6 / NAT64(464XLAT) 机器，容器的 IPv4 出不去
+        docker run -d --name "$TUNNEL_NAME" --restart always --network host \
+            --env-file "$TOKEN_FILE" "$TUNNEL_IMAGE" tunnel --no-autoupdate --edge-ip-version 6 run >/dev/null
+    else
+        docker run -d --name "$TUNNEL_NAME" --restart always --network "$NET" \
+            --env-file "$TOKEN_FILE" "$TUNNEL_IMAGE" tunnel --no-autoupdate run >/dev/null
+    fi
 }
 
 tunnel_connected() {
@@ -634,7 +642,11 @@ selfcheck_domain() {   # 非阻塞自检：从本机访问一次公开地址
         sleep 5
     done
     warn "暂时访问不通（最后返回 ${code:-无响应}）。常见原因："
-    echo "    502/503   公开主机名的服务地址填错，应为 http://$CNAME:$CPORT"
+    if [ "${TUNNEL_HOST:-0}" = "1" ]; then
+        echo "    502/503   公开主机名的服务地址填错，应为 http://127.0.0.1:$PORT"
+    else
+        echo "    502/503   公开主机名的服务地址填错，应为 http://$CNAME:$CPORT"
+    fi
     echo "    530/1033  隧道还没连上，或 token 不对"
     echo "    无响应    DNS 还没生效，等几分钟再试；或域名没有在 Cloudflare 托管"
 }
@@ -657,6 +669,8 @@ do_tunnel_setup() {
     echo "       Service URL：  http://$CNAME:$CPORT"
     echo "     （旧版界面：隧道的 Public Hostname 标签 → Add a public hostname，服务类型 HTTP，URL 填 $CNAME:$CPORT）"
     echo "     DNS 记录没有自动创建的话，手动加一条 CNAME：名称=子域名，目标=<隧道ID>.cfargotunnel.com，开启代理"
+    echo "  ※ 纯 IPv6 / NAT64 的机器（容器连不上 Cloudflare）：下面会问是否用“宿主机网络模式”，"
+    echo "    选了之后 Service URL 要改填 http://127.0.0.1:面板端口（脚本会在最后提示具体地址）"
     echo
     local raw token h
     read -r -p "粘贴隧道 token（回车取消）: " raw
@@ -667,6 +681,12 @@ do_tunnel_setup() {
     esac
     [ "${#token}" -ge 60 ] || { warn "token 太短，看起来不完整，请重新复制"; return 0; }
     case "$token" in eyJ*) ;; *) warn "token 通常以 eyJ 开头，你这个不是；继续尝试，失败请检查是否复制对了" ;; esac
+
+    if ask_yn "容器连不上 Cloudflare（如纯 IPv6 / NAT64 机器）? 用宿主机网络 + IPv6 运行隧道 (y/N):" n; then
+        TUNNEL_HOST=1
+    else
+        TUNNEL_HOST=0
+    fi
 
     read -r -p "你在后台设置的公开主机名（如 nav.example.com，用于显示和自检，可留空）: " h
     if [ -n "$h" ]; then
@@ -697,7 +717,18 @@ do_tunnel_setup() {
     DOMAIN="$h"
     save_state
 
-    if [ "$BIND" != "none" ] && ask_yn "关闭面板的公网直连端口 $PORT，只通过隧道访问（推荐）? (Y/n):" y; then
+    if [ "$TUNNEL_HOST" = "1" ]; then
+        # 宿主机网络的隧道只能通过 127.0.0.1:端口 回源，面板必须发布端口，且只绑本机最安全
+        if [ "$BIND" != "127.0.0.1" ]; then
+            BIND="127.0.0.1"
+            info "宿主机网络模式：面板改为只监听 127.0.0.1:$PORT（外网不可直连，仅隧道可访问）"
+            run_panel || die "容器重建失败"
+            save_state
+            sync_panel_fw
+            wait_up 30 && ok "已生效" || warn "没有响应，请查看日志"
+        fi
+        echo "★ Cloudflare 后台该隧道的 Service URL 请填：http://127.0.0.1:$PORT"
+    elif [ "$BIND" != "none" ] && ask_yn "关闭面板的公网直连端口 $PORT，只通过隧道访问（推荐）? (Y/n):" y; then
         BIND="none"
         run_panel || die "容器重建失败"
         save_state
@@ -728,7 +759,7 @@ do_tunnel_remove() {
     ask_yn "停止并删除隧道容器（通过域名将无法访问）? (y/N):" n || return 0
     docker rm -f "$TUNNEL_NAME" >/dev/null 2>&1
     rm -f "$TOKEN_FILE"
-    DOMAIN=""
+    DOMAIN=""; TUNNEL_HOST=0
     if [ "$BIND" = "none" ]; then
         if ask_yn "恢复直连 http://服务器IP:$PORT ？选 n 则仅本机可访问 (Y/n):" y; then
             BIND="0.0.0.0"
