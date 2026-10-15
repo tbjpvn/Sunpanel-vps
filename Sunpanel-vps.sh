@@ -1,68 +1,55 @@
 #!/usr/bin/env bash
-# =====================================================================
-#  VPS (Linux) - Sun-Panel 管理脚本（Docker + Cloudflare 隧道）
-#
-#  - 使用官方镜像 hslr/sun-panel（官方 1.8.x 正式版只以镜像/二进制发布）
-#  - 容器 restart=always：进程被杀、VPS 重启都会自动拉起，不需要 cron 守护
-#  - 通过 Cloudflare 隧道（cloudflared 容器）对外提供 https://你的域名：
-#      不占用 80/443、不用管证书，和 VPS 上其他服务（sing-box 等）互不干扰
-#  - 自动放行防火墙端口（ufw / firewalld / iptables），卸载时自动关闭
-#  - 数据保存在 /opt/sun-panel（conf / database / uploads），升级不丢
-#
-#  用法（需要 root）：bash sunpanel-vps.sh
-# =====================================================================
+# Sun-Panel 管理脚本（Docker + Cloudflare 隧道），需要 root：bash sunpanel-vps.sh
 set -u
 
 IMAGE="${SUNPANEL_IMAGE:-hslr/sun-panel:latest}"
 CNAME="sun-panel"
-TUNNEL_NAME="sunpanel-cloudflared"          # 专用名字，不会碰你其他的 cloudflared
+TUNNEL_NAME="sunpanel-cloudflared"
 TUNNEL_IMAGE="cloudflare/cloudflared:latest"
 NET="sunpanel-net"
 DATA_DIR="${SUNPANEL_DIR:-/opt/sun-panel}"
 STATE_FILE="$DATA_DIR/.sunpanel-vps.env"
-TOKEN_FILE="$DATA_DIR/.cf-tunnel.env"       # 仅 root 可读，保存 TUNNEL_TOKEN
-LEGACY_CRON="${SUNPANEL_CRON_FILE:-/etc/cron.d/sunpanel-renew}"   # 旧版（Caddy 续期版）遗留
+TOKEN_FILE="$DATA_DIR/.cf-tunnel.env"
+LEGACY_CRON="${SUNPANEL_CRON_FILE:-/etc/cron.d/sunpanel-renew}"
 ROLLBACK_TAG="sun-panel-rollback:prev"
-SP_BIN="${SUNPANEL_SHORTCUT:-/usr/local/bin/sp}"   # 快捷命令：输入 sp 打开主菜单
-SP_MARK="sunpanel-vps-shortcut-v1"                  # 用来识别这个 sp 是本脚本装的，不会误覆盖别人的命令
+SP_BIN="${SUNPANEL_SHORTCUT:-/usr/local/bin/sp}"
+SP_MARK="sunpanel-vps-shortcut-v1"
 IPV6_SYSCTL="/etc/sysctl.d/99-sunpanel-ipv6.conf"
-IPV6_SUBNET="fd7a:5e6c:3b1d::/64"                   # IPv6 模式下 docker 网络用的 ULA 子网（NAT66 出网）
-MIRROR="${SUNPANEL_MIRROR:-}"   # 可选：Docker Hub 加速站前缀，如 docker.1ms.run（拉取失败时自动改走它）
-CPORT=3002            # 容器内部端口（程序默认值，不要改）
-DEFAULT_PORT=3002     # 对外端口默认值（只是官方示例，可随意改）
+IPV6_SUBNET="fd7a:5e6c:3b1d::/64"
+MIRROR="${SUNPANEL_MIRROR:-}"
+CPORT=3002
+DEFAULT_PORT=3002
 
-# 配色：终端里显示颜色，重定向/非终端时自动不带颜色
-#   亮绿 = 菜单 / 需要你输入的提示 / 成功     亮黄 = 需要注意     亮红 = 重要警告 / 错误
-if [ -t 1 ]; then G=$'\033[1;92m'; Y=$'\033[1;93m'; RD=$'\033[1;91m'; PU=$'\033[1;95m'; R=$'\033[0m'; else G=""; Y=""; RD=""; PU=""; R=""; fi
+if [ -t 1 ]; then G=$'\033[1;92m'; Y=$'\033[1;93m'; RD=$'\033[1;91m'; PU=$'\033[1;95m'; R=$'\033[0m'
+else G=""; Y=""; RD=""; PU=""; R=""; fi
 
 info() { echo "➜ $*"; }
 ok()   { echo "${G}✅ $*${R}"; }
 warn() { echo "${Y}⚠️  $*${R}"; }
 die()  { echo "${RD}❌ $*${R}" >&2; exit 1; }
 menu() { echo "${G}$*${R}"; }
-menu_red() { echo "${RD}$*${R}"; }
 menu_purple() { echo "${PU}$*${R}"; }
-note() { echo "${Y}$*${R}"; }      # 需要注意的说明（黄）
-imp()  { echo "${RD}$*${R}"; }      # 重要警告（红）
+note() { echo "${Y}$*${R}"; }
+imp()  { echo "${RD}$*${R}"; }
 
-ask_yn() {  # ask_yn "提示(Y/n)" 默认值(y|n)
+has() { command -v "$1" >/dev/null 2>&1; }
+drm() { docker rm -f "$@" >/dev/null 2>&1; }
+
+ask_yn() {
     local a
     read -r -p "${G}$1 ${R}" a
-    a="${a:-${2:-n}}"
-    case "$a" in y|Y) return 0 ;; *) return 1 ;; esac
+    case "${a:-${2:-n}}" in y|Y) return 0 ;; *) return 1 ;; esac
 }
 
-# ---------------------------------------------------------------------
-# 状态文件
-# ---------------------------------------------------------------------
+net_is_v6() { [ "$(docker network inspect "$NET" -f '{{.EnableIPv6}}' 2>/dev/null)" = "true" ]; }
+
 load_state() {
     PORT="$DEFAULT_PORT"; BIND="0.0.0.0"; DOMAIN=""; FW_RULES=""; TUNNEL_HOST=0; NET_MODE=""; PANEL_IMAGE=""
     # shellcheck disable=SC1090
     [ -f "$STATE_FILE" ] && . "$STATE_FILE"
-    # 菜单 2 指定过版本的话，之后重建容器都沿用它；显式设置了 SUNPANEL_IMAGE 则以环境变量为准
     if [ -z "${SUNPANEL_IMAGE:-}" ] && [ -n "$PANEL_IMAGE" ]; then IMAGE="$PANEL_IMAGE"; fi
-    if [ -z "$NET_MODE" ]; then   # 旧版本没有这一项：按现有 docker 网络是否开了 IPv6 推断
-        if [ "$(docker network inspect "$NET" -f '{{.EnableIPv6}}' 2>/dev/null)" = "true" ]; then NET_MODE="v6"; else NET_MODE="v4"; fi
+    if [ -z "$NET_MODE" ]; then
+        if net_is_v6; then NET_MODE="v6"; else NET_MODE="v4"; fi
     fi
     return 0
 }
@@ -80,15 +67,12 @@ PANEL_IMAGE="$IMAGE"
 EOF
 }
 
-# ---------------------------------------------------------------------
-# 环境检查
-# ---------------------------------------------------------------------
 need_root() {
     [ "$(id -u)" -eq 0 ] || die "请用 root 运行（或 sudo bash $0）"
 }
 
 ensure_docker() {
-    if command -v docker >/dev/null 2>&1; then
+    if has docker; then
         docker info >/dev/null 2>&1 && return 0
         warn "已安装 docker 但服务没有运行，尝试启动 ..."
         systemctl start docker >/dev/null 2>&1 || service docker start >/dev/null 2>&1
@@ -99,20 +83,22 @@ ensure_docker() {
     warn "没有检测到 Docker。"
     ask_yn "用 Docker 官方安装脚本 (get.docker.com) 现在安装? (Y/n):" y \
         || die "已取消。请先自行安装 Docker 后再运行本脚本"
-    command -v curl >/dev/null 2>&1 || die "需要 curl 才能下载安装脚本，请先安装 curl"
+    has curl || die "需要 curl 才能下载安装脚本，请先安装 curl"
     curl -fsSL https://get.docker.com | sh || die "Docker 安装失败，请查看上面的报错"
     systemctl enable --now docker >/dev/null 2>&1
     docker info >/dev/null 2>&1 || die "Docker 已安装但服务未运行"
     ok "Docker 安装完成"
 }
 
+prep() { need_root; ensure_docker; load_state; }
+
 container_exists()  { docker inspect "$1" >/dev/null 2>&1; }
 container_running() { [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = "true" ]; }
 
-port_in_use() {   # TCP 端口是否已被监听
-    if command -v ss >/dev/null 2>&1; then
+port_in_use() {
+    if has ss; then
         ss -H -ltn "sport = :$1" 2>/dev/null | grep -q .
-    elif command -v netstat >/dev/null 2>&1; then
+    elif has netstat; then
         netstat -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"
     else
         return 1
@@ -120,7 +106,7 @@ port_in_use() {   # TCP 端口是否已被监听
 }
 
 port_owner() {
-    command -v ss >/dev/null 2>&1 && ss -H -ltnp "sport = :$1" 2>/dev/null | head -n3 | sed 's/^/    /'
+    has ss && ss -H -ltnp "sport = :$1" 2>/dev/null | head -n3 | sed 's/^/    /'
 }
 
 public_ip() {
@@ -129,31 +115,25 @@ public_ip() {
         || true
 }
 
-# 容器内部健康检查（不依赖是否对外发布端口）
 alive() {
     docker exec "$CNAME" wget -q -O /dev/null -T 3 "http://127.0.0.1:$CPORT/" >/dev/null 2>&1
 }
 
-wait_up() {  # wait_up 最长秒数
-    local i=0
-    while [ "$i" -lt "$1" ]; do
+wait_up() {
+    local i
+    for ((i = 0; i < $1; i++)); do
         container_running "$CNAME" && alive && return 0
         sleep 1
-        i=$((i + 1))
     done
     return 1
 }
 
-# ---------------------------------------------------------------------
-# 防火墙：自动放行 / 卸载时自动关闭
-#   只记录并关闭“本脚本新增”的规则，不碰原有规则（包括 SSH）
-# ---------------------------------------------------------------------
 fw_backend() {
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+    if has ufw && ufw status 2>/dev/null | grep -qi '^Status: active'; then
         echo ufw
-    elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    elif has firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
         echo firewalld
-    elif command -v iptables >/dev/null 2>&1 \
+    elif has iptables \
         && iptables -S INPUT 2>/dev/null | head -n1 | grep -qE -- '-P INPUT (DROP|REJECT)'; then
         echo iptables
     else
@@ -170,20 +150,19 @@ fw_rec_del() {
 }
 
 fw_persist() {
-    if command -v netfilter-persistent >/dev/null 2>&1; then
+    if has netfilter-persistent; then
         netfilter-persistent save >/dev/null 2>&1
-    elif command -v service >/dev/null 2>&1; then
+    elif has service; then
         service iptables save >/dev/null 2>&1
     fi
     return 0
 }
 
-fw_open() {   # fw_open 3002/tcp
-    local spec="$1" port proto be
+fw_open() {
+    local spec="$1" port proto
     port="${spec%/*}"; proto="${spec#*/}"
     fw_has "$spec" && return 0
-    be="$(fw_backend)"
-    case "$be" in
+    case "$(fw_backend)" in
         ufw)
             if ufw status 2>/dev/null | grep -qE "^${port}/${proto}[[:space:]]+ALLOW"; then
                 info "ufw 里已有 $spec 的放行规则，保持不动"; return 0
@@ -210,7 +189,7 @@ fw_open() {   # fw_open 3002/tcp
     esac
 }
 
-fw_close() {   # 只关闭本脚本打开过的规则
+fw_close() {
     local spec="$1" port proto
     port="${spec%/*}"; proto="${spec#*/}"
     fw_has "$spec" || return 0
@@ -230,22 +209,17 @@ fw_close_all() {
     for r in $FW_RULES; do fw_close "$r"; done
 }
 
-# ---------------------------------------------------------------------
-# 询问 / 创建容器
-# ---------------------------------------------------------------------
-ask_port() {   # 设置全局 PORT
-    local p
+ask_port() {
+    local p tries
     echo "（对外端口只是映射到容器内的 $CPORT，$DEFAULT_PORT 是官方示例，不是强制要求，可改成任意未占用端口）"
     while true; do
         read -r -p "${G}对外端口 [${PORT:-$DEFAULT_PORT}]（输入 r 随机生成 10000 以上的端口）: ${R}" p
         p="${p:-${PORT:-$DEFAULT_PORT}}"
         case "$p" in
             r|R)
-                local tries=0
-                while [ "$tries" -lt 50 ]; do
-                    p=$(( 10000 + (RANDOM * 32768 + RANDOM) % 55536 ))   # 10000-65535
+                for ((tries = 0; tries < 50; tries++)); do
+                    p=$(( 10000 + (RANDOM * 32768 + RANDOM) % 55536 ))
                     port_in_use "$p" || break
-                    tries=$((tries + 1))
                 done
                 if port_in_use "$p"; then warn "没找到空闲的随机端口，请手动输入"; continue; fi
                 info "已随机选择端口 $p" ;;
@@ -264,22 +238,20 @@ ask_port() {   # 设置全局 PORT
     done
 }
 
-ask_bind() {   # 设置全局 BIND
+ask_bind() {
     local s tunnel_on=0
     if [ "${TUNNEL_HOST:-0}" = "1" ]; then
-        # 宿主机网络模式：隧道只能经 127.0.0.1 回源，0.0.0.0 / 不发布 都不适用，直接固定
         BIND="127.0.0.1"
         info "隧道使用宿主机网络模式，监听方式固定为 127.0.0.1（仅本机，外网只能走隧道）"
         return 0
     fi
     container_running "$TUNNEL_NAME" && tunnel_on=1
-    [ "${TUNNEL_HOST:-0}" = "1" ] && tunnel_on=0   # 宿主机网络模式的隧道要靠 127.0.0.1 端口回源，不能选“不发布端口”
     echo "监听方式："
     echo "  1) 0.0.0.0    所有网卡，可用 http://服务器IP:端口 直接访问"
     echo "  2) 127.0.0.1  仅本机"
     [ "$tunnel_on" -eq 1 ] && echo "  3) 不发布端口  只能通过 Cloudflare 隧道访问（最安全，推荐）"
-    read -r -p "${G}请选择 [${BIND_DEFAULT:-1}]: ${R}" s
-    case "${s:-${BIND_DEFAULT:-1}}" in
+    read -r -p "${G}请选择 [1]: ${R}" s
+    case "${s:-1}" in
         1) BIND="0.0.0.0" ;;
         2) BIND="127.0.0.1" ;;
         3) [ "$tunnel_on" -eq 1 ] && BIND="none" || { warn "隧道没在运行（或隧道用宿主机网络模式，需要发布端口），不能选 3"; return 1; } ;;
@@ -297,12 +269,11 @@ ensure_net() {
     fi
 }
 
-pull_image() {   # pull_image 镜像  失败自动重试 3 次；设了 SUNPANEL_MIRROR 时再走加速站
-    local img="$1" n=1
-    while [ "$n" -le 3 ]; do
+pull_image() {
+    local img="$1" n
+    for ((n = 1; n <= 3; n++)); do
         docker pull "$img" && return 0
         [ "$n" -lt 3 ] && { warn "拉取失败，3 秒后重试（第 $n/3 次）..."; sleep 3; }
-        n=$((n + 1))
     done
     if [ -n "$MIRROR" ]; then
         warn "直连失败，改用加速站 $MIRROR ..."
@@ -314,12 +285,12 @@ pull_image() {   # pull_image 镜像  失败自动重试 3 次；设了 SUNPANEL
     return 1
 }
 
-run_panel() {   # run_panel [镜像]  使用全局 PORT / BIND
+run_panel() {
     local image="${1:-$IMAGE}"
     local -a pub=()
     ensure_net || return 1
     mkdir -p "$DATA_DIR/conf" "$DATA_DIR/database" "$DATA_DIR/uploads" || { warn "无法创建数据目录 $DATA_DIR"; return 1; }
-    docker rm -f "$CNAME" >/dev/null 2>&1
+    drm "$CNAME"
     [ "$BIND" != "none" ] && pub=(-p "${BIND}:${PORT}:${CPORT}")
     docker run -d --name "$CNAME" --restart always --network "$NET" \
         ${pub[@]+"${pub[@]}"} \
@@ -329,27 +300,38 @@ run_panel() {   # run_panel [镜像]  使用全局 PORT / BIND
         "$image" >/dev/null
 }
 
-sync_panel_fw() {   # 按当前 BIND 放行/关闭面板端口
+sync_panel_fw() {
     if [ "$BIND" = "0.0.0.0" ]; then fw_open "$PORT/tcp"; else fw_close "$PORT/tcp"; fi
 }
 
-backup_data() {   # 备份到 ~/sun-panel-backup.tar.gz（只保留最新一份），路径放进 BACKUP_FILE
+apply_panel() {
+    run_panel || die "容器重建失败"
+    save_state
+    sync_panel_fw
+    wait_up 30 && ok "${1:-已生效}" || warn "没有响应，请查看日志"
+}
+
+pack_data() {
+    local -a files=()
+    local d
+    for d in conf database uploads; do [ -e "$DATA_DIR/$d" ] && files+=("$d"); done
+    [ "${#files[@]}" -gt 0 ] || return 2
+    tar -czf "$1.tmp" -C "$DATA_DIR" "${files[@]}" && mv -f "$1.tmp" "$1" \
+        || { rm -f "$1.tmp"; return 1; }
+}
+
+backup_data() {
     BACKUP_FILE=""
     [ -d "$DATA_DIR" ] || return 0
-    local files="" d tmp="$HOME/sun-panel-backup.tar.gz.tmp"
-    for d in conf database uploads; do
-        [ -e "$DATA_DIR/$d" ] && files="$files $d"
-    done
-    [ -n "$files" ] || return 0
-    # shellcheck disable=SC2086
-    if tar -czf "$tmp" -C "$DATA_DIR" $files; then
-        rm -f "$HOME"/sun-panel-backup-*.tar.gz          # 清理旧版脚本留下的带时间戳备份
-        mv -f "$tmp" "$HOME/sun-panel-backup.tar.gz"
-        BACKUP_FILE="$HOME/sun-panel-backup.tar.gz"
-        ok "数据已备份（覆盖旧备份）: $BACKUP_FILE"
-    else
-        rm -f "$tmp"; warn "备份失败（旧备份保持不变）"; return 1
-    fi
+    local out="$HOME/sun-panel-backup.tar.gz"
+    pack_data "$out"
+    case $? in
+        0) rm -f "$HOME"/sun-panel-backup-*.tar.gz
+           BACKUP_FILE="$out"
+           ok "数据已备份（覆盖旧备份）: $BACKUP_FILE" ;;
+        2) return 0 ;;
+        *) warn "备份失败（旧备份保持不变）"; return 1 ;;
+    esac
 }
 
 show_access() {
@@ -367,14 +349,9 @@ show_access() {
     esac
 }
 
-# ---------------------------------------------------------------------
-# 1. 安装
-# ---------------------------------------------------------------------
 do_install() {
     echo "------------- 安装 Sun-Panel（Docker）-------------"
-    need_root
-    ensure_docker
-    load_state
+    prep
     if container_exists "$CNAME"; then
         warn "已经安装过了。更新 / 切换版本请用菜单 2，重装请先卸载。"
         return 0
@@ -386,15 +363,14 @@ do_install() {
         ask_yn "继续? (y/N):" n || { info "已取消"; return 0; }
         prepare_ipv6_host || die "IPv6 模式准备失败（已回滚），可重新运行并选择 IPv4"
     fi
-    if docker network inspect "$NET" >/dev/null 2>&1; then   # 残留的同名网络类型不对时，删掉重建
-        local want=false have=false
-        [ "$NET_MODE" = "v6" ] && want=true
-        net_is_v6 && have=true
-        [ "$want" = "$have" ] || docker network rm "$NET" >/dev/null 2>&1 || warn "旧的 docker 网络 $NET 删除失败，可能仍有容器在用"
+    if docker network inspect "$NET" >/dev/null 2>&1; then
+        local have=v4
+        net_is_v6 && have=v6
+        [ "$have" = "$NET_MODE" ] || docker network rm "$NET" >/dev/null 2>&1 || warn "旧的 docker 网络 $NET 删除失败，可能仍有容器在用"
     fi
 
     ask_port
-    BIND_DEFAULT=1; ask_bind || die "监听方式无效"
+    ask_bind || die "监听方式无效"
 
     info "拉取镜像 $IMAGE ..."
     pull_image "$IMAGE" || die "镜像拉取失败（网络问题？可设置 SUNPANEL_MIRROR=加速站域名 再运行）"
@@ -404,13 +380,10 @@ do_install() {
     save_state
     sync_panel_fw
 
-    if wait_up 30; then
-        ok "服务已正常响应"
-    else
-        warn "30 秒内没有响应，请用菜单 11 查看日志排查"
-    fi
+    wait_up 30 && ok "服务已正常响应" || warn "30 秒内没有响应，请用菜单 11 查看日志排查"
     if [ "$NET_MODE" = "v6" ]; then
-        if net_probe; then ok "容器 IPv6 出网正常（在线更新 / 在线图标可用）"; else warn "容器 IPv6 出网测试没通过，可到菜单 9 查看 / 重试"; fi
+        net_probe && ok "容器 IPv6 出网正常（在线更新 / 在线图标可用）" \
+            || warn "容器 IPv6 出网测试没通过，可到菜单 9 查看 / 重试"
     fi
 
     echo "=============================================="
@@ -420,23 +393,17 @@ do_install() {
     note "说明：Docker 发布的端口会绕过 ufw/firewalld 的过滤；想真正限制访问，请用隧道 + 不发布端口。"
     echo "=============================================="
 
-    if ask_yn "现在配置 Cloudflare 隧道（用域名访问，不占 80/443）? (y/N):" n; then
-        do_tunnel_setup
-    fi
+    ask_yn "现在配置 Cloudflare 隧道（用域名访问，不占 80/443）? (y/N):" n && do_tunnel_setup
 }
 
-# ---------------------------------------------------------------------
-# 2. 更新到指定版本
-#    面板网页里自己就能在线更新；这里用来安装指定版本，或回退到旧版本。失败自动回滚。
-# ---------------------------------------------------------------------
-image_repo() {   # 去掉镜像名里的 tag
+image_repo() {
     case "${1##*/}" in
         *:*) echo "${1%:*}" ;;
         *)   echo "$1" ;;
     esac
 }
 
-list_remote_tags() {   # 尽力从 Docker Hub 取最近的 tag，失败或非 Docker Hub 镜像就什么都不输出
+list_remote_tags() {
     local repo="$1" first="${1%%/*}"
     case "$first" in *.*|*:*) return 0 ;; esac
     case "$repo" in */*) ;; *) repo="library/$repo" ;; esac
@@ -444,11 +411,13 @@ list_remote_tags() {   # 尽力从 Docker Hub 取最近的 tag，失败或非 Do
         | grep -o '"name": *"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/' | head -n 15 | tr '\n' ' '
 }
 
+image_created() {
+    docker image inspect -f '{{.Created}}' "$1" 2>/dev/null | cut -c1-19
+}
+
 do_version_update() {
     echo "------------- 更新到指定版本 -------------"
-    need_root
-    ensure_docker
-    load_state
+    prep
     container_exists "$CNAME" || { warn "尚未安装，请先选择“安装”"; return 0; }
 
     local cur_img cur_id repo tags tag target new_id created
@@ -457,7 +426,7 @@ do_version_update() {
     [ -n "$cur_id" ] || die "读取当前镜像失败，未做任何改动"
     repo="$(image_repo "$IMAGE")"
 
-    echo "当前镜像：$cur_img（构建时间 $(docker image inspect -f '{{.Created}}' "$cur_id" 2>/dev/null | cut -c1-19)）"
+    echo "当前镜像：$cur_img（构建时间 $(image_created "$cur_id")）"
     note "面板网页里也可以直接在线更新；这里用来安装指定版本，或回退到旧版本。"
     tags="$(list_remote_tags "$repo")"
     [ -n "$tags" ] && echo "最近的版本（Docker Hub）：$tags"
@@ -469,7 +438,7 @@ do_version_update() {
     info "拉取镜像 $target ..."
     pull_image "$target" || { warn "镜像拉取失败（版本号不存在？网络问题？），未做任何改动（可设置 SUNPANEL_MIRROR=加速站域名 再试）"; return 1; }
     new_id="$(docker image inspect -f '{{.Id}}' "$target" 2>/dev/null)"
-    created="$(docker image inspect -f '{{.Created}}' "$target" 2>/dev/null | cut -c1-19)"
+    created="$(image_created "$target")"
 
     if [ "$cur_id" = "$new_id" ]; then
         IMAGE="$target"; save_state
@@ -488,7 +457,7 @@ do_version_update() {
     if run_panel "$target" && wait_up 40; then
         IMAGE="$target"; save_state
         ok "已更新到 $target"
-        docker rmi "$ROLLBACK_TAG" >/dev/null 2>&1   # 只删自己的旧镜像标签，不动系统里其他镜像
+        docker rmi "$ROLLBACK_TAG" >/dev/null 2>&1
     else
         warn "新版本启动失败或没有响应，回滚到旧镜像 ..."
         if run_panel "$ROLLBACK_TAG" && wait_up 30; then
@@ -500,14 +469,12 @@ do_version_update() {
     fi
 }
 
-# ---------------------------------------------------------------------
-# 3. 卸载（两种方式；自动关闭防火墙端口；只清理本脚本创建的东西）
-# ---------------------------------------------------------------------
-legacy_cleanup() {   # 清理旧版脚本（Caddy + 证书续期版）可能留下的东西
-    local line
+legacy_cleanup() {
+    local line what
+    local -a cmd
     LEGACY_FOUND=0
     if container_exists sunpanel-caddy; then
-        LEGACY_FOUND=1; docker rm -f sunpanel-caddy >/dev/null 2>&1; ok "已删除旧版遗留的 Caddy 容器"
+        LEGACY_FOUND=1; drm sunpanel-caddy; ok "已删除旧版遗留的 Caddy 容器"
     fi
     if [ -f "$LEGACY_CRON" ]; then
         LEGACY_FOUND=1; rm -f "$LEGACY_CRON"; ok "已删除旧版遗留的证书续期定时任务"
@@ -516,20 +483,19 @@ legacy_cleanup() {   # 清理旧版脚本（Caddy + 证书续期版）可能留�
         LEGACY_FOUND=1
         while IFS= read -r line; do
             case "$line" in
-                systemd:*)
-                    if systemctl start "${line#systemd:}" >/dev/null 2>&1; then ok "已还原被旧版停止的服务 $line"
-                    else warn "还原 $line 失败，请手动启动"; fi ;;
-                docker:*)
-                    if docker start "${line#docker:}" >/dev/null 2>&1; then ok "已还原被旧版停止的容器 $line"
-                    else warn "还原 $line 失败，请手动启动"; fi ;;
+                systemd:*) cmd=(systemctl start "${line#*:}"); what="服务" ;;
+                docker:*)  cmd=(docker start "${line#*:}");    what="容器" ;;
+                *) continue ;;
             esac
+            if "${cmd[@]}" >/dev/null 2>&1; then ok "已还原被旧版停止的$what $line"
+            else warn "还原 $line 失败，请手动启动"; fi
         done < "$DATA_DIR/.released"
         rm -f "$DATA_DIR/.released"
     fi
     return 0
 }
 
-wipe_data_dir() {   # 只删本脚本创建的内容，不 rm -rf 整个目录，避免误删别的东西
+wipe_data_dir() {
     rm -rf "$DATA_DIR/conf" "$DATA_DIR/database" "$DATA_DIR/uploads" \
            "$DATA_DIR/caddy" "$DATA_DIR/letsencrypt" "$DATA_DIR/sunpanel-vps.sh"
     rm -f "$STATE_FILE" "$TOKEN_FILE" "$DATA_DIR/.released"
@@ -541,7 +507,7 @@ wipe_data_dir() {   # 只删本脚本创建的内容，不 rm -rf 整个目录�
 do_uninstall() {
     echo "------------- 卸载 Sun-Panel -------------"
     need_root
-    command -v docker >/dev/null 2>&1 || { warn "没有安装 Docker，无需卸载"; return 0; }
+    has docker || { warn "没有安装 Docker，无需卸载"; return 0; }
     load_state
     local mode a n backups
     echo "卸载方式："
@@ -566,7 +532,7 @@ do_uninstall() {
         if [ -d "$DATA_DIR" ] && ask_yn "卸载前再备份一份到 $HOME ? (y/N):" n; then backup_data; fi
     fi
 
-    docker rm -f "$CNAME" "$TUNNEL_NAME" >/dev/null 2>&1
+    drm "$CNAME" "$TUNNEL_NAME"
     docker network rm "$NET" >/dev/null 2>&1
     docker rmi "$ROLLBACK_TAG" >/dev/null 2>&1
     rm -f "$TOKEN_FILE"
@@ -576,8 +542,8 @@ do_uninstall() {
     legacy_cleanup
 
     if [ "$mode" = "2" ]; then
-        docker rmi "$IMAGE" "$TUNNEL_IMAGE" >/dev/null 2>&1   # 被别的容器占用的会自动跳过
-        [ "${LEGACY_FOUND:-0}" = "1" ] && docker rmi caddy:2 certbot/certbot >/dev/null 2>&1
+        docker rmi "$IMAGE" "$TUNNEL_IMAGE" >/dev/null 2>&1
+        [ "$LEGACY_FOUND" = "1" ] && docker rmi caddy:2 certbot/certbot >/dev/null 2>&1
         ok "镜像已清理（仍被其他容器使用的会保留）"
         wipe_data_dir
         ok "数据目录已清除"
@@ -605,19 +571,13 @@ do_uninstall() {
     ok "卸载完成"
 }
 
-# ---------------------------------------------------------------------
-# 4-6. 状态 / 重启 / 重置密码
-# ---------------------------------------------------------------------
 do_status() {
-    command -v docker >/dev/null 2>&1 || { warn "没有安装 Docker"; return 0; }
+    has docker || { warn "没有安装 Docker"; return 0; }
     load_state
-    if ! container_exists "$CNAME"; then
-        warn "尚未安装"
-        return 0
-    fi
+    container_exists "$CNAME" || { warn "尚未安装"; return 0; }
     echo "容器状态:"
     docker ps -a --filter "name=^${CNAME}\$" --format '    {{.Names}}  {{.Status}}  {{.Ports}}'
-    echo "镜像构建时间: $(docker inspect -f '{{.Image}}' "$CNAME" 2>/dev/null | xargs docker image inspect -f '{{.Created}}' 2>/dev/null | cut -c1-19)"
+    echo "镜像构建时间: $(image_created "$(docker inspect -f '{{.Image}}' "$CNAME" 2>/dev/null)")"
     if container_running "$CNAME" && alive; then echo "服务响应: 正常"; else echo "服务响应: 无响应"; fi
     if container_exists "$TUNNEL_NAME"; then
         docker ps -a --filter "name=^${TUNNEL_NAME}\$" --format '    {{.Names}}  {{.Status}}'
@@ -644,33 +604,20 @@ do_reset_pw() {
     docker exec -it -w /app "$CNAME" ./sun-panel -password-reset
 }
 
-# ---------------------------------------------------------------------
-# 7. 修改端口 / 监听方式（防火墙自动同步）
-# ---------------------------------------------------------------------
 do_port() {
-    need_root
-    ensure_docker
-    load_state
+    prep
     container_exists "$CNAME" || { warn "尚未安装"; return 0; }
     local old_port="$PORT"
     echo "当前: 监听 $BIND  端口 $PORT"
     ask_port
-    BIND_DEFAULT=1; ask_bind || return 0
+    ask_bind || return 0
     info "重建容器 ..."
-    run_panel || die "容器启动失败"
+    apply_panel
     [ "$old_port" != "$PORT" ] && fw_close "$old_port/tcp"
-    save_state
-    sync_panel_fw
-    wait_up 30 && ok "已生效" || warn "没有响应，请查看日志"
     show_access
 }
 
-# ---------------------------------------------------------------------
-# 8. Cloudflare 隧道
-#    - 专用容器 sunpanel-cloudflared，和 sing-box 的 argo 隧道是两条独立的隧道
-#    - 与面板同在 docker 网络里，Cloudflare 后台的服务地址填 http://sun-panel:3002
-# ---------------------------------------------------------------------
-parse_token() {   # 容忍用户粘贴整条命令，只取最后一段并去掉引号
+parse_token() {
     local t="$1"
     t="${t##* }"; t="${t//\"/}"; t="${t//\'/}"; t="${t//$'\r'/}"
     echo "$t"
@@ -679,39 +626,35 @@ parse_token() {   # 容忍用户粘贴整条命令，只取最后一段并去掉
 run_tunnel() {
     [ -f "$TOKEN_FILE" ] || return 1
     ensure_net || return 1
-    docker rm -f "$TUNNEL_NAME" >/dev/null 2>&1
+    drm "$TUNNEL_NAME"
+    local net="$NET"
+    local -a edge=()
     if [ "${TUNNEL_HOST:-0}" = "1" ]; then
-        # 宿主机网络 + 强制 IPv6 连边缘：用于纯 IPv6 / NAT64(464XLAT) 机器，容器的 IPv4 出不去
-        docker run -d --name "$TUNNEL_NAME" --restart always --network host \
-            --env-file "$TOKEN_FILE" "$TUNNEL_IMAGE" tunnel --no-autoupdate --edge-ip-version 6 run >/dev/null
-    else
-        local extra=""
-        [ "${NET_MODE:-v4}" = "v6" ] && extra="--edge-ip-version 6"   # IPv6 模式：容器走 IPv6 连 Cloudflare 边缘
-        # shellcheck disable=SC2086
-        docker run -d --name "$TUNNEL_NAME" --restart always --network "$NET" \
-            --env-file "$TOKEN_FILE" "$TUNNEL_IMAGE" tunnel --no-autoupdate $extra run >/dev/null
+        net="host"; edge=(--edge-ip-version 6)
+    elif [ "${NET_MODE:-v4}" = "v6" ]; then
+        edge=(--edge-ip-version 6)
     fi
+    docker run -d --name "$TUNNEL_NAME" --restart always --network "$net" \
+        --env-file "$TOKEN_FILE" "$TUNNEL_IMAGE" tunnel --no-autoupdate ${edge[@]+"${edge[@]}"} run >/dev/null
 }
 
 tunnel_connected() {
     docker logs --tail 50 "$TUNNEL_NAME" 2>&1 | grep -q "Registered tunnel connection"
 }
 
-wait_tunnel() {  # wait_tunnel 最长秒数
-    local i=0
-    while [ "$i" -lt "$1" ]; do
+wait_tunnel() {
+    local i
+    for ((i = 0; i < $1; i++)); do
         container_running "$TUNNEL_NAME" || return 1
         tunnel_connected && return 0
         sleep 1
-        i=$((i + 1))
     done
     return 1
 }
 
-selfcheck_domain() {   # 非阻塞自检：从本机访问一次公开地址
+selfcheck_domain() {
     local i code
-    [ -n "$DOMAIN" ] || return 0
-    command -v curl >/dev/null 2>&1 || return 0
+    [ -n "$DOMAIN" ] && has curl || return 0
     info "自检 https://$DOMAIN ..."
     for i in 1 2 3; do
         code="$(curl -s -o /dev/null -m 10 -w '%{http_code}' "https://$DOMAIN/" 2>/dev/null)"
@@ -732,9 +675,7 @@ selfcheck_domain() {   # 非阻塞自检：从本机访问一次公开地址
 
 do_tunnel_setup() {
     echo "------------- 配置 Cloudflare 隧道 -------------"
-    need_root
-    ensure_docker
-    load_state
+    prep
     container_exists "$CNAME" || { warn "请先安装 Sun-Panel"; return 0; }
 
     echo "先在 Cloudflare 后台为面板【新建一条专用隧道】（不要复用 sing-box 的 argo 隧道）："
@@ -761,16 +702,17 @@ do_tunnel_setup() {
     case "$token" in eyJ*) ;; *) warn "token 通常以 eyJ 开头，你这个不是；继续尝试，失败请检查是否复制对了" ;; esac
 
     local was_host="$TUNNEL_HOST"
-    TUNNEL_HOST=0
-    [ "${SUNPANEL_TUNNEL_HOST:-0}" = "1" ] && TUNNEL_HOST=1   # 备用：强制宿主机网络模式（Service URL 填 http://127.0.0.1:端口）
+    TUNNEL_HOST="${SUNPANEL_TUNNEL_HOST:-0}"
+    [ "$TUNNEL_HOST" = "1" ] || TUNNEL_HOST=0
 
     read -r -p "${G}你在后台设置的公开主机名（如 nav.example.com，用于显示和自检，可留空）: ${R}" h
     if [ -n "$h" ]; then
         case "$h" in
-            *[!A-Za-z0-9.-]*|.*|*..*|-*|*.) warn "域名格式不对，已忽略"; h="" ;;
+            *[!A-Za-z0-9.-]*|.*|*..*|-*|*.) h="" ;;
             *.*) ;;
-            *) warn "域名格式不对，已忽略"; h="" ;;
+            *) h="" ;;
         esac
+        [ -n "$h" ] || warn "域名格式不对，已忽略"
     fi
 
     mkdir -p "$DATA_DIR"
@@ -795,22 +737,15 @@ do_tunnel_setup() {
     save_state
 
     if [ "$TUNNEL_HOST" = "1" ]; then
-        # 宿主机网络的隧道只能通过 127.0.0.1:端口 回源，面板必须发布端口，且只绑本机最安全
         if [ "$BIND" != "127.0.0.1" ]; then
             BIND="127.0.0.1"
             info "宿主机网络模式：面板改为只监听 127.0.0.1:$PORT（外网不可直连，仅隧道可访问）"
-            run_panel || die "容器重建失败"
-            save_state
-            sync_panel_fw
-            wait_up 30 && ok "已生效" || warn "没有响应，请查看日志"
+            apply_panel
         fi
         imp "★ Cloudflare 后台该隧道的 Service URL 请填：http://127.0.0.1:$PORT"
     elif [ "$BIND" != "none" ] && ask_yn "关闭面板的公网直连端口 $PORT，只通过隧道访问（推荐）? (Y/n):" y; then
         BIND="none"
-        run_panel || die "容器重建失败"
-        save_state
-        sync_panel_fw
-        wait_up 30 && ok "已改为不发布端口" || warn "没有响应，请查看日志"
+        apply_panel "已改为不发布端口"
     fi
     if [ "$was_host" = "1" ] && [ "$TUNNEL_HOST" = "0" ]; then
         imp "★ 隧道已改为容器网络模式：Cloudflare 后台该隧道的 Service URL 请改回 http://$CNAME:$CPORT"
@@ -822,6 +757,7 @@ do_tunnel_setup() {
 do_tunnel_update() {
     need_root
     ensure_docker
+    load_state
     container_exists "$TUNNEL_NAME" || { warn "没有配置隧道"; return 0; }
     local old new
     old="$(docker inspect -f '{{.Image}}' "$TUNNEL_NAME" 2>/dev/null)"
@@ -837,7 +773,7 @@ do_tunnel_remove() {
     load_state
     container_exists "$TUNNEL_NAME" || { warn "没有配置隧道"; return 0; }
     ask_yn "停止并删除隧道容器（通过域名将无法访问）? (y/N):" n || return 0
-    docker rm -f "$TUNNEL_NAME" >/dev/null 2>&1
+    drm "$TUNNEL_NAME"
     rm -f "$TOKEN_FILE"
     DOMAIN=""; TUNNEL_HOST=0
     if [ "$BIND" = "none" ]; then
@@ -870,14 +806,11 @@ do_tunnel() {
     esac
 }
 
-# ---------------------------------------------------------------------
-# 9-10. 备份 / 日志
-# ---------------------------------------------------------------------
-restore_data() {   # 从备份恢复 conf / database / uploads；恢复前先把当前数据另存一份
+restore_data() {
     need_root
-    local -a arr=()
-    local f i pick src bad prerestore="$HOME/sun-panel-backup.prerestore.tar.gz"
-    while IFS= read -r f; do [ -n "$f" ] && arr+=("$f"); done < <(ls -t "$HOME"/sun-panel-backup.tar.gz "$HOME"/sun-panel-backup-*.tar.gz 2>/dev/null)
+    local -a arr
+    local f i pick src bad list prerestore="$HOME/sun-panel-backup.prerestore.tar.gz"
+    mapfile -t arr < <(ls -t "$HOME"/sun-panel-backup.tar.gz "$HOME"/sun-panel-backup-*.tar.gz 2>/dev/null)
 
     echo "可用的备份："
     i=1
@@ -897,11 +830,10 @@ restore_data() {   # 从备份恢复 conf / database / uploads；恢复前先把
     esac
     [ -f "$src" ] || { warn "找不到文件：$src"; return 1; }
 
-    # 校验：必须是 tar.gz，且只含 conf / database / uploads，不能有绝对路径或 ..
-    tar -tzf "$src" >/dev/null 2>&1 || { warn "不是有效的 tar.gz 备份文件"; return 1; }
-    bad=$(tar -tzf "$src" | grep -Ev '^(\./)?(conf|database|uploads)(/|$)' | head -n1)
+    list="$(tar -tzf "$src" 2>/dev/null)" || { warn "不是有效的 tar.gz 备份文件"; return 1; }
+    bad="$(grep -Ev '^(\./)?(conf|database|uploads)(/|$)' <<<"$list" | head -n1)"
     [ -z "$bad" ] || { warn "备份内容不符合预期（出现：$bad），已拒绝恢复"; return 1; }
-    tar -tzf "$src" | grep -Eq '(^|/)\.\.(/|$)' && { warn "备份里含有不安全的路径，已拒绝恢复"; return 1; }
+    grep -Eq '(^|/)\.\.(/|$)' <<<"$list" && { warn "备份里含有不安全的路径，已拒绝恢复"; return 1; }
 
     imp "恢复会用备份覆盖当前面板数据（账号、书签、上传文件等）。"
     note "当前数据会先另存为 $prerestore（只保留最近一次）。"
@@ -909,14 +841,12 @@ restore_data() {   # 从备份恢复 conf / database / uploads；恢复前先把
     ask_yn "确认恢复? (y/N):" n || { echo "已取消"; return 0; }
 
     mkdir -p "$DATA_DIR"
-    local cur=""
-    for f in conf database uploads; do [ -e "$DATA_DIR/$f" ] && cur="$cur $f"; done
-    if [ -n "$cur" ]; then
-        # shellcheck disable=SC2086
-        tar -czf "$prerestore.tmp" -C "$DATA_DIR" $cur && mv -f "$prerestore.tmp" "$prerestore" \
-            || { rm -f "$prerestore.tmp"; warn "无法另存当前数据，已中止（没有改动任何数据）"; return 1; }
-        ok "当前数据已另存: $prerestore"
-    fi
+    pack_data "$prerestore"
+    case $? in
+        0) ok "当前数据已另存: $prerestore" ;;
+        2) ;;
+        *) warn "无法另存当前数据，已中止（没有改动任何数据）"; return 1 ;;
+    esac
 
     container_exists "$CNAME" && docker stop "$CNAME" >/dev/null 2>&1
     rm -rf "$DATA_DIR/conf" "$DATA_DIR/database" "$DATA_DIR/uploads"
@@ -954,7 +884,7 @@ do_backup() {
 }
 
 do_logs() {
-    command -v docker >/dev/null 2>&1 || { warn "没有安装 Docker"; return 0; }
+    has docker || { warn "没有安装 Docker"; return 0; }
     local t
     echo "  1) Sun-Panel 日志"
     echo "  2) Cloudflare 隧道日志"
@@ -966,19 +896,11 @@ do_logs() {
     esac
 }
 
-# ---------------------------------------------------------------------
-# 网络模式：IPv4（默认）/ IPv6（纯 IPv6 或 NAT64 机器）
-#   纯 IPv6 / NAT64 机器的 IPv4 出不去，容器里的面板没法“在线更新 / 在线图标”，cloudflared 也连不上 Cloudflare。
-#   IPv6 模式 = 给 docker 网络开 IPv6（ULA 子网 + NAT66 伪装），容器走宿主机的 IPv6 出网；
-#   宿主机的 DNS64（如 nat64.net）会把只有 IPv4 的站点解析成可达的 IPv6 地址。cloudflared 也强制走 IPv6 连边缘。
-# ---------------------------------------------------------------------
-net_probe() {   # 在 sunpanel-net 里临时起一个容器测 IPv6 出网，成功返回 0
+net_probe() {
     docker run --rm --network "$NET" busybox wget -T 8 -qO- "http://[2606:4700:4700::1111]/cdn-cgi/trace" 2>/dev/null | grep -q '^ip='
 }
 
-net_is_v6() { [ "$(docker network inspect "$NET" -f '{{.EnableIPv6}}' 2>/dev/null)" = "true" ]; }
-
-ask_net_mode() {   # 设置全局 NET_MODE（v4 / v6）
+ask_net_mode() {
     local v4ok=0 v6ok=0 def=1 c
     info "检测宿主机出网 ..."
     curl -4 -m 6 -fsS "https://api.cloudflare.com/cdn-cgi/trace" >/dev/null 2>&1 && v4ok=1
@@ -989,8 +911,7 @@ ask_net_mode() {   # 设置全局 NET_MODE（v4 / v6）
     menu "  2) IPv6  纯 IPv6 / NAT64 机器（IPv4 出不去：面板在线更新、在线图标、隧道都会连不上）"
     note "  检测结果：宿主机 IPv4 出网 $([ "$v4ok" = "1" ] && echo 正常 || echo 不通)，IPv6 出网 $([ "$v6ok" = "1" ] && echo 正常 || echo 不通)"
     read -r -p "${G}请选择 [$def]: ${R}" c
-    c="${c:-$def}"
-    case "$c" in
+    case "${c:-$def}" in
         1) NET_MODE="v4" ;;
         2) NET_MODE="v6" ;;
         *) warn "无效选择"; return 1 ;;
@@ -1005,8 +926,8 @@ ipv6_mode_notice() {
     imp  "  改网络有断连风险，建议确认能从云厂商控制台（VNC / 救援）进入服务器后再继续"
 }
 
-prepare_ipv6_host() {   # 成功 return 0；失败 return 1（已自动回滚）
-    command -v ip6tables >/dev/null 2>&1 || { warn "没有 ip6tables，Docker 的 IPv6 NAT 需要它（apt install iptables）"; return 1; }
+prepare_ipv6_host() {
+    has ip6tables || { warn "没有 ip6tables，Docker 的 IPv6 NAT 需要它（apt install iptables）"; return 1; }
     info "检查宿主机自身的 IPv6 出网 ..."
     curl -6 -m 8 -fsS "https://api.cloudflare.com/cdn-cgi/trace" >/dev/null 2>&1 || { warn "宿主机 IPv6 出网不通，IPv6 模式用不了"; return 1; }
     ok "宿主机 IPv6 正常"
@@ -1030,9 +951,8 @@ prepare_ipv6_host() {   # 成功 return 0；失败 return 1（已自动回滚）
     ok "IPv6 转发已开启，宿主机 IPv6 仍正常"
 }
 
-rebuild_net() {   # 按当前 NET_MODE 重建 docker 网络，并重建面板 / 隧道容器（数据目录不受影响）
-    docker rm -f "$CNAME" >/dev/null 2>&1
-    docker rm -f "$TUNNEL_NAME" >/dev/null 2>&1
+rebuild_net() {
+    drm "$CNAME" "$TUNNEL_NAME"
     docker network rm "$NET" >/dev/null 2>&1
     ensure_net || return 1
     run_panel || return 1
@@ -1044,7 +964,7 @@ rebuild_net() {   # 按当前 NET_MODE 重建 docker 网络，并重建面板 / 
 
 do_net_mode() {
     echo "------------- 网络模式（IPv4 / IPv6）-------------"
-    need_root; ensure_docker; load_state
+    prep
     container_exists "$CNAME" || { warn "请先安装 Sun-Panel（安装时会让你选择网络类型）"; return 0; }
     local cur="$NET_MODE" new c
     echo "当前网络模式：${cur/v/IPv}"
@@ -1090,11 +1010,6 @@ do_net_mode() {
     fi
 }
 
-# ---------------------------------------------------------------------
-# 快捷命令 sp：把本脚本复制到 /usr/local/bin/sp，以后直接输入 sp 就能调出主菜单
-#   - 需要 root 且本脚本是以文件方式运行（bash 脚本文件）；用 bash <(curl ...) 方式运行时无法安装
-#   - 已存在的、不是本脚本装的 sp 不会被覆盖；脚本更新后再运行一次会自动同步
-# ---------------------------------------------------------------------
 install_shortcut() {
     [ "$(id -u)" -eq 0 ] || return 0
     local self="${BASH_SOURCE[0]:-$0}"
@@ -1117,9 +1032,6 @@ remove_shortcut() {
     return 0
 }
 
-# ---------------------------------------------------------------------
-# 菜单
-# ---------------------------------------------------------------------
 install_shortcut
 
 while true; do
@@ -1129,7 +1041,7 @@ while true; do
     menu "=========================================="
     menu "  1) 安装脚本"
     menu "  2) 更新到指定版本"
-    menu_red "  3) 卸载脚本"
+    imp  "  3) 卸载脚本"
     menu "  4) 查看状态"
     menu "  5) 重启服务"
     menu "  6) 重置管理员密码"
