@@ -33,7 +33,7 @@ DEFAULT_PORT=3002     # 对外端口默认值（只是官方示例，可随意�
 
 # 配色：终端里显示颜色，重定向/非终端时自动不带颜色
 #   亮绿 = 菜单 / 需要你输入的提示 / 成功     亮黄 = 需要注意     亮红 = 重要警告 / 错误
-if [ -t 1 ]; then G=$'\033[1;92m'; Y=$'\033[1;93m'; RD=$'\033[1;91m'; R=$'\033[0m'; else G=""; Y=""; RD=""; R=""; fi
+if [ -t 1 ]; then G=$'\033[1;92m'; Y=$'\033[1;93m'; RD=$'\033[1;91m'; PU=$'\033[1;95m'; R=$'\033[0m'; else G=""; Y=""; RD=""; PU=""; R=""; fi
 
 info() { echo "➜ $*"; }
 ok()   { echo "${G}✅ $*${R}"; }
@@ -41,6 +41,7 @@ warn() { echo "${Y}⚠️  $*${R}"; }
 die()  { echo "${RD}❌ $*${R}" >&2; exit 1; }
 menu() { echo "${G}$*${R}"; }
 menu_red() { echo "${RD}$*${R}"; }
+menu_purple() { echo "${PU}$*${R}"; }
 note() { echo "${Y}$*${R}"; }      # 需要注意的说明（黄）
 imp()  { echo "${RD}$*${R}"; }      # 重要警告（红）
 
@@ -406,10 +407,10 @@ do_install() {
     if wait_up 30; then
         ok "服务已正常响应"
     else
-        warn "30 秒内没有响应，请用菜单 10 查看日志排查"
+        warn "30 秒内没有响应，请用菜单 11 查看日志排查"
     fi
     if [ "$NET_MODE" = "v6" ]; then
-        if net_probe; then ok "容器 IPv6 出网正常（在线更新 / 在线图标可用）"; else warn "容器 IPv6 出网测试没通过，可到菜单 11 查看 / 重试"; fi
+        if net_probe; then ok "容器 IPv6 出网正常（在线更新 / 在线图标可用）"; else warn "容器 IPv6 出网测试没通过，可到菜单 9 查看 / 重试"; fi
     fi
 
     echo "=============================================="
@@ -493,7 +494,7 @@ do_version_update() {
         if run_panel "$ROLLBACK_TAG" && wait_up 30; then
             ok "已回滚，旧版本恢复运行"
         else
-            warn "回滚后仍无响应，请用菜单 10 查看日志；数据备份: ${BACKUP_FILE:-无}（可用菜单 9 恢复）"
+            warn "回滚后仍无响应，请用菜单 11 查看日志；数据备份: ${BACKUP_FILE:-无}（可用菜单 10 恢复）"
         fi
         return 1
     fi
@@ -620,7 +621,7 @@ do_status() {
     if container_running "$CNAME" && alive; then echo "服务响应: 正常"; else echo "服务响应: 无响应"; fi
     if container_exists "$TUNNEL_NAME"; then
         docker ps -a --filter "name=^${TUNNEL_NAME}\$" --format '    {{.Names}}  {{.Status}}'
-        if tunnel_connected; then echo "隧道连接: 已连接 Cloudflare"; else echo "隧道连接: 未确认（请看菜单 10 的隧道日志）"; fi
+        if tunnel_connected; then echo "隧道连接: 已连接 Cloudflare"; else echo "隧道连接: 未确认（请看菜单 11 的隧道日志）"; fi
         echo "域名: ${DOMAIN:-未记录}"
     else
         echo "Cloudflare 隧道: 未配置"
@@ -747,7 +748,7 @@ do_tunnel_setup() {
     echo "       Service URL：  http://$CNAME:$CPORT"
     echo "     （旧版界面：隧道的 Public Hostname 标签 → Add a public hostname，服务类型 HTTP，URL 填 $CNAME:$CPORT）"
     echo "     DNS 记录没有自动创建的话，手动加一条 CNAME：名称=子域名，目标=<隧道ID>.cfargotunnel.com，开启代理"
-    note "  ※ 纯 IPv6 / NAT64 的机器请先到菜单 11 切换为 IPv6 模式，隧道才连得上 Cloudflare"
+    note "  ※ 纯 IPv6 / NAT64 的机器请先到菜单 9 切换为 IPv6 模式，隧道才连得上 Cloudflare"
     echo
     local raw token h
     read -r -p "${G}粘贴隧道 token（回车取消）: ${R}" raw
@@ -785,7 +786,7 @@ do_tunnel_setup() {
         warn "40 秒内没有看到连接成功。最近日志："
         docker logs --tail 15 "$TUNNEL_NAME" 2>&1 | sed 's/^/    /'
         note "    常见原因：token 复制不完整 / 服务器连不上 Cloudflare（出站 7844 端口被限制）"
-        note "    纯 IPv6 / NAT64 机器：请到菜单 11 把网络模式切到 IPv6，再重试"
+        note "    纯 IPv6 / NAT64 机器：请到菜单 9 把网络模式切到 IPv6，再重试"
         note "    若日志里 precheck 的 TCP 443 / api.cloudflare.com 也失败，说明是【容器出网】有问题（DNS / 转发 / NAT），不是 token 的事："
         echo "      docker run --rm --network $NET busybox nslookup api.cloudflare.com"
         echo "      docker run --rm --network $NET busybox wget -T 8 -qO- https://api.cloudflare.com/cdn-cgi/trace"
@@ -904,7 +905,7 @@ restore_data() {   # 从备份恢复 conf / database / uploads；恢复前先把
 
     imp "恢复会用备份覆盖当前面板数据（账号、书签、上传文件等）。"
     note "当前数据会先另存为 $prerestore（只保留最近一次）。"
-    note "备份里没有的内容：隧道 token、端口 / 监听方式 / 网络模式。需要的话恢复后到菜单 8 / 7 / 11 重新设置。"
+    note "备份里没有的内容：隧道 token、端口 / 监听方式 / 网络模式。需要的话恢复后到菜单 8 / 7 / 9 重新设置。"
     ask_yn "确认恢复? (y/N):" n || { echo "已取消"; return 0; }
 
     mkdir -p "$DATA_DIR"
@@ -931,7 +932,7 @@ restore_data() {   # 从备份恢复 conf / database / uploads；恢复前先把
 
     if container_exists "$CNAME"; then
         docker restart "$CNAME" >/dev/null 2>&1
-        wait_up 30 && ok "面板已重启，请用恢复后的账号登录" || warn "面板暂时没有响应，请用菜单 10 查看日志"
+        wait_up 30 && ok "面板已重启，请用恢复后的账号登录" || warn "面板暂时没有响应，请用菜单 11 查看日志"
     else
         note "还没有安装面板：请先用菜单 1 安装，安装后会直接使用这份数据。"
     fi
@@ -1072,7 +1073,7 @@ do_net_mode() {
     if ! rebuild_net; then
         warn "切换失败，恢复为 ${cur/v/IPv} 模式"
         NET_MODE="$cur"
-        rebuild_net || warn "恢复也没成功，请用菜单 10 查看日志，或再运行一次本菜单"
+        rebuild_net || warn "恢复也没成功，请用菜单 11 查看日志，或再运行一次本菜单"
         return 1
     fi
     save_state
@@ -1134,10 +1135,10 @@ while true; do
     menu "  6) 重置管理员密码"
     menu "  7) 修改端口/监听方式"
     menu "  8) CF隧道管理"
-    menu "  9) 备份与恢复"
-    menu " 10) 查看日志"
-    menu " 11) 网络模式切换"
-    menu "  0) 退出"
+    menu "  9) 网络模式切换"
+    menu " 10) 备份与恢复"
+    menu " 11) 查看日志"
+    menu_purple "  0) 退出"
     [ -e "$SP_BIN" ] && note "  （快捷命令：在终端输入 sp 随时打开本菜单）"
     read -r -p "${G}请选择 [0-11]: ${R}" choice
     case "$choice" in
@@ -1149,9 +1150,9 @@ while true; do
         6) ( do_reset_pw ) ;;
         7) ( do_port ) ;;
         8) ( do_tunnel ) ;;
-        9) ( do_backup ) ;;
-        10) ( do_logs ) ;;
-        11) ( do_net_mode ) ;;
+        9) ( do_net_mode ) ;;
+        10) ( do_backup ) ;;
+        11) ( do_logs ) ;;
         0) echo "Bye."; exit 0 ;;
         *) warn "无效选项" ;;
     esac
