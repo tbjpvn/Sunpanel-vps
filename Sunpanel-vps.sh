@@ -55,9 +55,11 @@ ask_yn() {  # ask_yn "提示(Y/n)" 默认值(y|n)
 # 状态文件
 # ---------------------------------------------------------------------
 load_state() {
-    PORT="$DEFAULT_PORT"; BIND="0.0.0.0"; DOMAIN=""; FW_RULES=""; TUNNEL_HOST=0; NET_MODE=""
+    PORT="$DEFAULT_PORT"; BIND="0.0.0.0"; DOMAIN=""; FW_RULES=""; TUNNEL_HOST=0; NET_MODE=""; PANEL_IMAGE=""
     # shellcheck disable=SC1090
     [ -f "$STATE_FILE" ] && . "$STATE_FILE"
+    # 菜单 2 指定过版本的话，之后重建容器都沿用它；显式设置了 SUNPANEL_IMAGE 则以环境变量为准
+    if [ -z "${SUNPANEL_IMAGE:-}" ] && [ -n "$PANEL_IMAGE" ]; then IMAGE="$PANEL_IMAGE"; fi
     if [ -z "$NET_MODE" ]; then   # 旧版本没有这一项：按现有 docker 网络是否开了 IPv6 推断
         if [ "$(docker network inspect "$NET" -f '{{.EnableIPv6}}' 2>/dev/null)" = "true" ]; then NET_MODE="v6"; else NET_MODE="v4"; fi
     fi
@@ -73,6 +75,7 @@ DOMAIN="$DOMAIN"
 FW_RULES="$FW_RULES"
 TUNNEL_HOST="$TUNNEL_HOST"
 NET_MODE="$NET_MODE"
+PANEL_IMAGE="$IMAGE"
 EOF
 }
 
@@ -372,7 +375,7 @@ do_install() {
     ensure_docker
     load_state
     if container_exists "$CNAME"; then
-        warn "已经安装过了。升级请用菜单 2，重装请先卸载。"
+        warn "已经安装过了。更新 / 切换版本请用菜单 2，重装请先卸载。"
         return 0
     fi
 
@@ -422,56 +425,78 @@ do_install() {
 }
 
 # ---------------------------------------------------------------------
-# 2. 升级（拉取最新官方镜像，失败自动回滚）
+# 2. 更新到指定版本
+#    面板网页里自己就能在线更新；这里用来安装指定版本，或回退到旧版本。失败自动回滚。
 # ---------------------------------------------------------------------
-do_upgrade() {
-    echo "------------- 升级 Sun-Panel -------------"
+image_repo() {   # 去掉镜像名里的 tag
+    case "${1##*/}" in
+        *:*) echo "${1%:*}" ;;
+        *)   echo "$1" ;;
+    esac
+}
+
+list_remote_tags() {   # 尽力从 Docker Hub 取最近的 tag，失败或非 Docker Hub 镜像就什么都不输出
+    local repo="$1" first="${1%%/*}"
+    case "$first" in *.*|*:*) return 0 ;; esac
+    case "$repo" in */*) ;; *) repo="library/$repo" ;; esac
+    curl -m 8 -fsS "https://hub.docker.com/v2/repositories/$repo/tags?page_size=20&ordering=last_updated" 2>/dev/null \
+        | grep -o '"name": *"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/' | head -n 15 | tr '\n' ' '
+}
+
+do_version_update() {
+    echo "------------- 更新到指定版本 -------------"
     need_root
     ensure_docker
     load_state
     container_exists "$CNAME" || { warn "尚未安装，请先选择“安装”"; return 0; }
 
-    local old_id new_id created
-    old_id="$(docker inspect -f '{{.Image}}' "$CNAME" 2>/dev/null)"
-    [ -n "$old_id" ] || die "读取当前镜像失败，未做任何改动"
+    local cur_img cur_id repo tags tag target new_id created
+    cur_img="$(docker inspect -f '{{.Config.Image}}' "$CNAME" 2>/dev/null)"
+    cur_id="$(docker inspect -f '{{.Image}}' "$CNAME" 2>/dev/null)"
+    [ -n "$cur_id" ] || die "读取当前镜像失败，未做任何改动"
+    repo="$(image_repo "$IMAGE")"
 
-    info "拉取最新镜像 $IMAGE ..."
-    pull_image "$IMAGE" || die "镜像拉取失败，未做任何改动（可设置 SUNPANEL_MIRROR=加速站域名 再试）"
-    new_id="$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null)"
-    created="$(docker image inspect -f '{{.Created}}' "$IMAGE" 2>/dev/null | cut -c1-19)"
+    echo "当前镜像：$cur_img（构建时间 $(docker image inspect -f '{{.Created}}' "$cur_id" 2>/dev/null | cut -c1-19)）"
+    note "面板网页里也可以直接在线更新；这里用来安装指定版本，或回退到旧版本。"
+    tags="$(list_remote_tags "$repo")"
+    [ -n "$tags" ] && echo "最近的版本（Docker Hub）：$tags"
+    read -r -p "${G}输入要更新到的版本号，如 1.3.0（latest 为最新，回车取消）: ${R}" tag
+    [ -n "$tag" ] || { echo "已取消"; return 0; }
+    [[ "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || { warn "版本号格式不对"; return 1; }
 
-    if [ "$old_id" = "$new_id" ]; then
-        ok "面板已经是最新镜像（构建时间 $created），无需升级"
-        upgrade_tunnel_if_any
+    target="$repo:$tag"
+    info "拉取镜像 $target ..."
+    pull_image "$target" || { warn "镜像拉取失败（版本号不存在？网络问题？），未做任何改动（可设置 SUNPANEL_MIRROR=加速站域名 再试）"; return 1; }
+    new_id="$(docker image inspect -f '{{.Id}}' "$target" 2>/dev/null)"
+    created="$(docker image inspect -f '{{.Created}}' "$target" 2>/dev/null | cut -c1-19)"
+
+    if [ "$cur_id" = "$new_id" ]; then
+        IMAGE="$target"; save_state
+        ok "当前运行的已经是这个版本（$target，构建时间 $created），无需更新"
         return 0
     fi
 
-    echo "发现新镜像（构建时间 $created）"
-    ask_yn "升级? 会先备份数据，失败自动回滚 (y/N):" n || { echo "已取消"; return 0; }
+    echo "将更新到 $target（构建时间 $created）"
+    note "回退到旧版本时，若新版本已升级过数据库结构，旧版本可能无法启动；脚本会先备份数据，启动失败会自动回滚。"
+    ask_yn "继续? (y/N):" n || { echo "已取消"; return 0; }
 
     backup_data
-    docker tag "$old_id" "$ROLLBACK_TAG" || die "无法给旧镜像打回滚标签，已停止（未做任何改动）"
+    docker tag "$cur_id" "$ROLLBACK_TAG" || die "无法给旧镜像打回滚标签，已停止（未做任何改动）"
 
-    info "用新镜像重建容器 ..."
-    if run_panel "$IMAGE" && wait_up 40; then
-        ok "升级成功"
+    info "用 $target 重建容器 ..."
+    if run_panel "$target" && wait_up 40; then
+        IMAGE="$target"; save_state
+        ok "已更新到 $target"
         docker rmi "$ROLLBACK_TAG" >/dev/null 2>&1   # 只删自己的旧镜像标签，不动系统里其他镜像
-        upgrade_tunnel_if_any
     else
         warn "新版本启动失败或没有响应，回滚到旧镜像 ..."
         if run_panel "$ROLLBACK_TAG" && wait_up 30; then
             ok "已回滚，旧版本恢复运行"
         else
-            warn "回滚后仍无响应，请用菜单 10 查看日志；数据备份: ${BACKUP_FILE:-无}"
+            warn "回滚后仍无响应，请用菜单 10 查看日志；数据备份: ${BACKUP_FILE:-无}（可用菜单 9 恢复）"
         fi
         return 1
     fi
-}
-
-upgrade_tunnel_if_any() {   # 升级面板时顺带检查 cloudflared 是否有新版
-    container_exists "$TUNNEL_NAME" || return 0
-    ask_yn "检测到 Cloudflare 隧道容器，同时检查并更新 cloudflared? (Y/n):" y || return 0
-    do_tunnel_update
 }
 
 # ---------------------------------------------------------------------
@@ -1102,7 +1127,7 @@ while true; do
     menu "  VPS - Sun-Panel 管理脚本（Docker + CF 隧道）"
     menu "=========================================="
     menu "  1) 安装"
-    menu "  2) 升级（拉取最新官方镜像，失败自动回滚）"
+    menu "  2) 更新到指定版本（面板网页里也可在线更新）"
     menu_red "  3) 卸载（自动关闭防火墙端口）"
     menu "  4) 查看状态"
     menu "  5) 重启服务"
@@ -1117,7 +1142,7 @@ while true; do
     read -r -p "${G}请选择 [0-11]: ${R}" choice
     case "$choice" in
         1) ( do_install ) ;;
-        2) ( do_upgrade ) ;;
+        2) ( do_version_update ) ;;
         3) ( do_uninstall ) ;;
         4) ( do_status ) ;;
         5) ( do_restart ) ;;
