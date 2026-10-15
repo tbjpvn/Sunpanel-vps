@@ -847,10 +847,84 @@ do_tunnel() {
 # ---------------------------------------------------------------------
 # 9-10. 备份 / 日志
 # ---------------------------------------------------------------------
+restore_data() {   # 从备份恢复 conf / database / uploads；恢复前先把当前数据另存一份
+    need_root
+    local -a arr=()
+    local f i pick src bad prerestore="$HOME/sun-panel-backup.prerestore.tar.gz"
+    while IFS= read -r f; do [ -n "$f" ] && arr+=("$f"); done < <(ls -t "$HOME"/sun-panel-backup.tar.gz "$HOME"/sun-panel-backup-*.tar.gz 2>/dev/null)
+
+    echo "可用的备份："
+    i=1
+    for f in "${arr[@]}"; do
+        menu "  $i) $f   ($(du -h "$f" | cut -f1), $(date -r "$f" '+%F %T'))"
+        i=$((i + 1))
+    done
+    menu "  p) 指定其他备份文件路径（比如从别的服务器传过来的 .tar.gz）"
+    [ "${#arr[@]}" -eq 0 ] && note "  （$HOME 下没有找到本脚本生成的备份）"
+    read -r -p "${G}请选择（回车取消）: ${R}" pick
+    case "$pick" in
+        '') echo "已取消"; return 0 ;;
+        p|P) read -r -p "${G}备份文件完整路径: ${R}" src; [ -n "$src" ] || { echo "已取消"; return 0; } ;;
+        *[!0-9]*) warn "无效选择"; return 1 ;;
+        *) [ "$pick" -ge 1 ] && [ "$pick" -le "${#arr[@]}" ] || { warn "无效选择"; return 1; }
+           src="${arr[$((pick - 1))]}" ;;
+    esac
+    [ -f "$src" ] || { warn "找不到文件：$src"; return 1; }
+
+    # 校验：必须是 tar.gz，且只含 conf / database / uploads，不能有绝对路径或 ..
+    tar -tzf "$src" >/dev/null 2>&1 || { warn "不是有效的 tar.gz 备份文件"; return 1; }
+    bad=$(tar -tzf "$src" | grep -Ev '^(\./)?(conf|database|uploads)(/|$)' | head -n1)
+    [ -z "$bad" ] || { warn "备份内容不符合预期（出现：$bad），已拒绝恢复"; return 1; }
+    tar -tzf "$src" | grep -Eq '(^|/)\.\.(/|$)' && { warn "备份里含有不安全的路径，已拒绝恢复"; return 1; }
+
+    imp "恢复会用备份覆盖当前面板数据（账号、书签、上传文件等）。"
+    note "当前数据会先另存为 $prerestore（只保留最近一次）。"
+    note "备份里没有的内容：隧道 token、端口 / 监听方式 / 网络模式。需要的话恢复后到菜单 8 / 7 / 11 重新设置。"
+    ask_yn "确认恢复? (y/N):" n || { echo "已取消"; return 0; }
+
+    mkdir -p "$DATA_DIR"
+    local cur=""
+    for f in conf database uploads; do [ -e "$DATA_DIR/$f" ] && cur="$cur $f"; done
+    if [ -n "$cur" ]; then
+        # shellcheck disable=SC2086
+        tar -czf "$prerestore.tmp" -C "$DATA_DIR" $cur && mv -f "$prerestore.tmp" "$prerestore" \
+            || { rm -f "$prerestore.tmp"; warn "无法另存当前数据，已中止（没有改动任何数据）"; return 1; }
+        ok "当前数据已另存: $prerestore"
+    fi
+
+    container_exists "$CNAME" && docker stop "$CNAME" >/dev/null 2>&1
+    rm -rf "$DATA_DIR/conf" "$DATA_DIR/database" "$DATA_DIR/uploads"
+    if ! tar -xzf "$src" -C "$DATA_DIR"; then
+        warn "解压失败"
+        if [ -f "$prerestore" ]; then
+            tar -xzf "$prerestore" -C "$DATA_DIR" && ok "已还原为恢复前的数据"
+        fi
+        container_exists "$CNAME" && docker start "$CNAME" >/dev/null 2>&1
+        return 1
+    fi
+    ok "数据已恢复"
+
+    if container_exists "$CNAME"; then
+        docker restart "$CNAME" >/dev/null 2>&1
+        wait_up 30 && ok "面板已重启，请用恢复后的账号登录" || warn "面板暂时没有响应，请用菜单 10 查看日志"
+    else
+        note "还没有安装面板：请先用菜单 1 安装，安装后会直接使用这份数据。"
+    fi
+}
+
 do_backup() {
     need_root
-    [ -d "$DATA_DIR" ] || { warn "没有数据目录"; return 0; }
-    backup_data
+    echo "------------- 备份与恢复 -------------"
+    menu "  1) 备份数据（覆盖 $HOME/sun-panel-backup.tar.gz）"
+    menu "  2) 恢复数据（重装后用）"
+    local c
+    read -r -p "${G}请选择（回车取消）: ${R}" c
+    case "$c" in
+        1) [ -d "$DATA_DIR" ] || { warn "没有数据目录"; return 0; }; backup_data ;;
+        2) restore_data ;;
+        '') echo "已取消" ;;
+        *) warn "无效选择" ;;
+    esac
 }
 
 do_logs() {
@@ -1035,7 +1109,7 @@ while true; do
     menu "  6) 重置管理员密码"
     menu "  7) 修改端口 / 监听方式"
     menu "  8) Cloudflare 隧道（配置 / 更新 / 移除）"
-    menu "  9) 备份数据"
+    menu "  9) 备份与恢复"
     menu " 10) 查看日志"
     menu " 11) 网络模式（IPv4 / IPv6 切换；纯 IPv6 / NAT64 机器选 IPv6）"
     menu "  0) 退出"
