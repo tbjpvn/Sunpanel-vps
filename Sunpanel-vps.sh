@@ -25,6 +25,8 @@ LEGACY_CRON="${SUNPANEL_CRON_FILE:-/etc/cron.d/sunpanel-renew}"   # 旧版（Cad
 ROLLBACK_TAG="sun-panel-rollback:prev"
 SP_BIN="${SUNPANEL_SHORTCUT:-/usr/local/bin/sp}"   # 快捷命令：输入 sp 打开主菜单
 SP_MARK="sunpanel-vps-shortcut-v1"                  # 用来识别这个 sp 是本脚本装的，不会误覆盖别人的命令
+IPV6_SYSCTL="/etc/sysctl.d/99-sunpanel-ipv6.conf"
+IPV6_SUBNET="fd7a:5e6c:3b1d::/64"                   # IPv6 模式下 docker 网络用的 ULA 子网（NAT66 出网）
 MIRROR="${SUNPANEL_MIRROR:-}"   # 可选：Docker Hub 加速站前缀，如 docker.1ms.run（拉取失败时自动改走它）
 CPORT=3002            # 容器内部端口（程序默认值，不要改）
 DEFAULT_PORT=3002     # 对外端口默认值（只是官方示例，可随意改）
@@ -53,9 +55,12 @@ ask_yn() {  # ask_yn "提示(Y/n)" 默认值(y|n)
 # 状态文件
 # ---------------------------------------------------------------------
 load_state() {
-    PORT="$DEFAULT_PORT"; BIND="0.0.0.0"; DOMAIN=""; FW_RULES=""; TUNNEL_HOST=0
+    PORT="$DEFAULT_PORT"; BIND="0.0.0.0"; DOMAIN=""; FW_RULES=""; TUNNEL_HOST=0; NET_MODE=""
     # shellcheck disable=SC1090
     [ -f "$STATE_FILE" ] && . "$STATE_FILE"
+    if [ -z "$NET_MODE" ]; then   # 旧版本没有这一项：按现有 docker 网络是否开了 IPv6 推断
+        if [ "$(docker network inspect "$NET" -f '{{.EnableIPv6}}' 2>/dev/null)" = "true" ]; then NET_MODE="v6"; else NET_MODE="v4"; fi
+    fi
     return 0
 }
 
@@ -67,6 +72,7 @@ BIND="$BIND"
 DOMAIN="$DOMAIN"
 FW_RULES="$FW_RULES"
 TUNNEL_HOST="$TUNNEL_HOST"
+NET_MODE="$NET_MODE"
 EOF
 }
 
@@ -279,7 +285,12 @@ ask_bind() {   # 设置全局 BIND
 
 ensure_net() {
     docker network inspect "$NET" >/dev/null 2>&1 && return 0
-    docker network create "$NET" >/dev/null 2>&1 || { warn "创建 docker 网络 $NET 失败"; return 1; }
+    if [ "${NET_MODE:-v4}" = "v6" ]; then
+        docker network create --ipv6 --subnet "$IPV6_SUBNET" "$NET" >/dev/null 2>&1 \
+            || { warn "创建 IPv6 docker 网络 $NET 失败（Docker 版本过旧或 ip6tables 不可用？）"; return 1; }
+    else
+        docker network create "$NET" >/dev/null 2>&1 || { warn "创建 docker 网络 $NET 失败"; return 1; }
+    fi
 }
 
 pull_image() {   # pull_image 镜像  失败自动重试 3 次；设了 SUNPANEL_MIRROR 时再走加速站
@@ -365,6 +376,19 @@ do_install() {
         return 0
     fi
 
+    ask_net_mode || die "网络类型选择无效"
+    if [ "$NET_MODE" = "v6" ]; then
+        ipv6_mode_notice
+        ask_yn "继续? (y/N):" n || { info "已取消"; return 0; }
+        prepare_ipv6_host || die "IPv6 模式准备失败（已回滚），可重新运行并选择 IPv4"
+    fi
+    if docker network inspect "$NET" >/dev/null 2>&1; then   # 残留的同名网络类型不对时，删掉重建
+        local want=false have=false
+        [ "$NET_MODE" = "v6" ] && want=true
+        net_is_v6 && have=true
+        [ "$want" = "$have" ] || docker network rm "$NET" >/dev/null 2>&1 || warn "旧的 docker 网络 $NET 删除失败，可能仍有容器在用"
+    fi
+
     ask_port
     BIND_DEFAULT=1; ask_bind || die "监听方式无效"
 
@@ -380,6 +404,9 @@ do_install() {
         ok "服务已正常响应"
     else
         warn "30 秒内没有响应，请用菜单 10 查看日志排查"
+    fi
+    if [ "$NET_MODE" = "v6" ]; then
+        if net_probe; then ok "容器 IPv6 出网正常（在线更新 / 在线图标可用）"; else warn "容器 IPv6 出网测试没通过，可到菜单 11 查看 / 重试"; fi
     fi
 
     echo "=============================================="
@@ -632,8 +659,11 @@ run_tunnel() {
         docker run -d --name "$TUNNEL_NAME" --restart always --network host \
             --env-file "$TOKEN_FILE" "$TUNNEL_IMAGE" tunnel --no-autoupdate --edge-ip-version 6 run >/dev/null
     else
+        local extra=""
+        [ "${NET_MODE:-v4}" = "v6" ] && extra="--edge-ip-version 6"   # IPv6 模式：容器走 IPv6 连 Cloudflare 边缘
+        # shellcheck disable=SC2086
         docker run -d --name "$TUNNEL_NAME" --restart always --network "$NET" \
-            --env-file "$TOKEN_FILE" "$TUNNEL_IMAGE" tunnel --no-autoupdate run >/dev/null
+            --env-file "$TOKEN_FILE" "$TUNNEL_IMAGE" tunnel --no-autoupdate $extra run >/dev/null
     fi
 }
 
@@ -692,8 +722,7 @@ do_tunnel_setup() {
     echo "       Service URL：  http://$CNAME:$CPORT"
     echo "     （旧版界面：隧道的 Public Hostname 标签 → Add a public hostname，服务类型 HTTP，URL 填 $CNAME:$CPORT）"
     echo "     DNS 记录没有自动创建的话，手动加一条 CNAME：名称=子域名，目标=<隧道ID>.cfargotunnel.com，开启代理"
-    note "  ※ 纯 IPv6 / NAT64 的机器（容器连不上 Cloudflare）：下面会问是否用“宿主机网络模式”，"
-    note "    选了之后 Service URL 要改填 http://127.0.0.1:面板端口（脚本会在最后提示具体地址）"
+    note "  ※ 纯 IPv6 / NAT64 的机器请先到菜单 11 切换为 IPv6 模式，隧道才连得上 Cloudflare"
     echo
     local raw token h
     read -r -p "${G}粘贴隧道 token（回车取消）: ${R}" raw
@@ -705,11 +734,9 @@ do_tunnel_setup() {
     [ "${#token}" -ge 60 ] || { warn "token 太短，看起来不完整，请重新复制"; return 0; }
     case "$token" in eyJ*) ;; *) warn "token 通常以 eyJ 开头，你这个不是；继续尝试，失败请检查是否复制对了" ;; esac
 
-    if ask_yn "容器连不上 Cloudflare（如纯 IPv6 / NAT64 机器）? 用宿主机网络 + IPv6 运行隧道 (y/N):" n; then
-        TUNNEL_HOST=1
-    else
-        TUNNEL_HOST=0
-    fi
+    local was_host="$TUNNEL_HOST"
+    TUNNEL_HOST=0
+    [ "${SUNPANEL_TUNNEL_HOST:-0}" = "1" ] && TUNNEL_HOST=1   # 备用：强制宿主机网络模式（Service URL 填 http://127.0.0.1:端口）
 
     read -r -p "${G}你在后台设置的公开主机名（如 nav.example.com，用于显示和自检，可留空）: ${R}" h
     if [ -n "$h" ]; then
@@ -733,6 +760,7 @@ do_tunnel_setup() {
         warn "40 秒内没有看到连接成功。最近日志："
         docker logs --tail 15 "$TUNNEL_NAME" 2>&1 | sed 's/^/    /'
         note "    常见原因：token 复制不完整 / 服务器连不上 Cloudflare（出站 7844 端口被限制）"
+        note "    纯 IPv6 / NAT64 机器：请到菜单 11 把网络模式切到 IPv6，再重试"
         note "    若日志里 precheck 的 TCP 443 / api.cloudflare.com 也失败，说明是【容器出网】有问题（DNS / 转发 / NAT），不是 token 的事："
         echo "      docker run --rm --network $NET busybox nslookup api.cloudflare.com"
         echo "      docker run --rm --network $NET busybox wget -T 8 -qO- https://api.cloudflare.com/cdn-cgi/trace"
@@ -757,6 +785,9 @@ do_tunnel_setup() {
         save_state
         sync_panel_fw
         wait_up 30 && ok "已改为不发布端口" || warn "没有响应，请查看日志"
+    fi
+    if [ "$was_host" = "1" ] && [ "$TUNNEL_HOST" = "0" ]; then
+        imp "★ 隧道已改为容器网络模式：Cloudflare 后台该隧道的 Service URL 请改回 http://$CNAME:$CPORT"
     fi
     selfcheck_domain
     show_access
@@ -836,39 +867,53 @@ do_logs() {
 }
 
 # ---------------------------------------------------------------------
-# 面板容器出网（纯 IPv6 / NAT64 机器）：
-#   这类机器的 IPv4 出不去，容器里的面板就没法“在线更新 / 在线图标”等所有联网功能。
-#   做法：给 docker 网络开 IPv6（ULA 子网 + NAT66 伪装），让容器走宿主机的 IPv6 出网；
-#   宿主机的 DNS64（如 nat64.net）会把只有 IPv4 的站点解析成可达的 IPv6 地址。
+# 网络模式：IPv4（默认）/ IPv6（纯 IPv6 或 NAT64 机器）
+#   纯 IPv6 / NAT64 机器的 IPv4 出不去，容器里的面板没法“在线更新 / 在线图标”，cloudflared 也连不上 Cloudflare。
+#   IPv6 模式 = 给 docker 网络开 IPv6（ULA 子网 + NAT66 伪装），容器走宿主机的 IPv6 出网；
+#   宿主机的 DNS64（如 nat64.net）会把只有 IPv4 的站点解析成可达的 IPv6 地址。cloudflared 也强制走 IPv6 连边缘。
 # ---------------------------------------------------------------------
-IPV6_SYSCTL="/etc/sysctl.d/99-sunpanel-ipv6.conf"
-IPV6_SUBNET="fd7a:5e6c:3b1d::/64"
-
 net_probe() {   # 在 sunpanel-net 里临时起一个容器测 IPv6 出网，成功返回 0
     docker run --rm --network "$NET" busybox wget -T 8 -qO- "http://[2606:4700:4700::1111]/cdn-cgi/trace" 2>/dev/null | grep -q '^ip='
 }
 
-do_ipv6_net() {
-    need_root; ensure_docker
-    load_state   # 读取端口 / 监听方式（run_panel 要用，没有会因 set -u 报 BIND unbound）
-    command -v ip6tables >/dev/null 2>&1 || die "没有 ip6tables，Docker 的 IPv6 NAT 需要它（apt install iptables）"
-    info "先检查宿主机自身的 IPv6 出网 ..."
-    curl -6 -m 8 -fsS "https://api.cloudflare.com/cdn-cgi/trace" >/dev/null 2>&1 || die "宿主机 IPv6 出网不通，这个方案用不了"
+net_is_v6() { [ "$(docker network inspect "$NET" -f '{{.EnableIPv6}}' 2>/dev/null)" = "true" ]; }
+
+ask_net_mode() {   # 设置全局 NET_MODE（v4 / v6）
+    local v4ok=0 v6ok=0 def=1 c
+    info "检测宿主机出网 ..."
+    curl -4 -m 6 -fsS "https://api.cloudflare.com/cdn-cgi/trace" >/dev/null 2>&1 && v4ok=1
+    curl -6 -m 6 -fsS "https://api.cloudflare.com/cdn-cgi/trace" >/dev/null 2>&1 && v6ok=1
+    [ "$v4ok" = "0" ] && [ "$v6ok" = "1" ] && def=2
+    echo "服务器网络类型："
+    menu "  1) IPv4  普通 VPS（默认）"
+    menu "  2) IPv6  纯 IPv6 / NAT64 机器（IPv4 出不去：面板在线更新、在线图标、隧道都会连不上）"
+    note "  检测结果：宿主机 IPv4 出网 $([ "$v4ok" = "1" ] && echo 正常 || echo 不通)，IPv6 出网 $([ "$v6ok" = "1" ] && echo 正常 || echo 不通)"
+    read -r -p "${G}请选择 [$def]: ${R}" c
+    c="${c:-$def}"
+    case "$c" in
+        1) NET_MODE="v4" ;;
+        2) NET_MODE="v6" ;;
+        *) warn "无效选择"; return 1 ;;
+    esac
+}
+
+ipv6_mode_notice() {
+    note "IPv6 模式会："
+    note "  1) 给出口网卡设置 accept_ra=2，再开启 IPv6 转发（写入 $IPV6_SYSCTL 持久化）"
+    note "     —— 开转发后内核默认会不再接收路由通告，可能丢掉默认 IPv6 路由导致断连，accept_ra=2 就是防这个的"
+    note "  2) docker 网络 $NET 使用 IPv6（子网 $IPV6_SUBNET，NAT66 出网）"
+    imp  "  改网络有断连风险，建议确认能从云厂商控制台（VNC / 救援）进入服务器后再继续"
+}
+
+prepare_ipv6_host() {   # 成功 return 0；失败 return 1（已自动回滚）
+    command -v ip6tables >/dev/null 2>&1 || { warn "没有 ip6tables，Docker 的 IPv6 NAT 需要它（apt install iptables）"; return 1; }
+    info "检查宿主机自身的 IPv6 出网 ..."
+    curl -6 -m 8 -fsS "https://api.cloudflare.com/cdn-cgi/trace" >/dev/null 2>&1 || { warn "宿主机 IPv6 出网不通，IPv6 模式用不了"; return 1; }
     ok "宿主机 IPv6 正常"
 
-    local iface
+    local iface old_fwd old_ra
     iface=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n1)
-    [ -n "$iface" ] || die "找不到 IPv6 出口网卡"
-
-    note "将要做的事："
-    note "  1) 对网卡 $iface 设置 accept_ra=2，再开启 IPv6 转发（并写入 $IPV6_SYSCTL 持久化）"
-    note "     —— 开转发后内核默认会不再接收路由通告，可能丢掉默认 IPv6 路由导致断连，accept_ra=2 就是防这个的"
-    note "  2) 重建 docker 网络 $NET（开启 IPv6，子网 $IPV6_SUBNET）"
-    note "  3) 重建面板容器（数据在 $DATA_DIR，不受影响）；隧道若是容器网络模式也会重建"
-    imp  "  改网络有断连风险，建议确认能从云厂商控制台（VNC / 救援）进入服务器后再继续"
-    ask_yn "继续? (y/N):" n || { info "已取消"; return 0; }
-
-    local old_fwd old_ra
+    [ -n "$iface" ] || { warn "找不到 IPv6 出口网卡"; return 1; }
     old_fwd=$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo 0)
     old_ra=$(sysctl -n "net.ipv6.conf.$iface.accept_ra" 2>/dev/null || echo 1)
     sysctl -w "net.ipv6.conf.$iface.accept_ra=2" >/dev/null
@@ -876,31 +921,72 @@ do_ipv6_net() {
     printf 'net.ipv6.conf.%s.accept_ra=2\nnet.ipv6.conf.all.forwarding=1\n' "$iface" > "$IPV6_SYSCTL"
     sleep 2
     if ! ip -6 route show default 2>/dev/null | grep -q . || ! curl -6 -m 8 -fsS "https://api.cloudflare.com/cdn-cgi/trace" >/dev/null 2>&1; then
-        warn "开启转发后宿主机 IPv6 出网异常，正在回滚设置"
+        warn "开启转发后宿主机 IPv6 出网异常，已回滚设置"
         sysctl -w net.ipv6.conf.all.forwarding="$old_fwd" >/dev/null
         sysctl -w "net.ipv6.conf.$iface.accept_ra=$old_ra" >/dev/null
         rm -f "$IPV6_SYSCTL"
-        die "已回滚，没有改动 docker 网络"
+        return 1
     fi
     ok "IPv6 转发已开启，宿主机 IPv6 仍正常"
+}
 
+rebuild_net() {   # 按当前 NET_MODE 重建 docker 网络，并重建面板 / 隧道容器（数据目录不受影响）
     docker rm -f "$CNAME" >/dev/null 2>&1
     docker rm -f "$TUNNEL_NAME" >/dev/null 2>&1
     docker network rm "$NET" >/dev/null 2>&1
-    if ! docker network create --ipv6 --subnet "$IPV6_SUBNET" "$NET" >/dev/null 2>&1; then
-        warn "创建 IPv6 网络失败（Docker 版本过旧或 ip6tables 不可用），恢复为普通网络"
-        ensure_net; run_panel; [ -f "$TOKEN_FILE" ] && run_tunnel
-        die "已恢复原状"
+    ensure_net || return 1
+    run_panel || return 1
+    if [ -f "$TOKEN_FILE" ]; then
+        run_tunnel || warn "隧道容器重建失败，请到菜单 8 处理"
     fi
-    run_panel || die "面板容器重建失败"
-    [ -f "$TOKEN_FILE" ] && { run_tunnel || warn "隧道容器重建失败，请到菜单 8 处理"; }
-    wait_up 30 && ok "面板已重新启动" || warn "面板暂时没有响应，请查看日志"
+    return 0
+}
 
-    info "测试容器 IPv6 出网 ..."
-    if net_probe; then
-        ok "面板容器已经能出网了，现在可以试试在线更新 / 在线图标"
+do_net_mode() {
+    echo "------------- 网络模式（IPv4 / IPv6）-------------"
+    need_root; ensure_docker; load_state
+    container_exists "$CNAME" || { warn "请先安装 Sun-Panel（安装时会让你选择网络类型）"; return 0; }
+    local cur="$NET_MODE" new c
+    echo "当前网络模式：${cur/v/IPv}"
+    menu "  1) IPv4  普通 VPS"
+    menu "  2) IPv6  纯 IPv6 / NAT64 机器（容器靠 IPv6 出网）"
+    read -r -p "${G}选择要切换到的模式（回车取消）: ${R}" c
+    case "$c" in
+        1) new="v4" ;;
+        2) new="v6" ;;
+        '') echo "已取消"; return 0 ;;
+        *) warn "无效选择"; return 0 ;;
+    esac
+    [ "$new" = "$cur" ] && { ok "已经是 ${new/v/IPv} 模式，无需切换"; return 0; }
+
+    if [ "$new" = "v6" ]; then
+        ipv6_mode_notice
+        note "  3) 重建面板容器（隧道若是容器网络模式也会重建）"
+        ask_yn "继续? (y/N):" n || { info "已取消"; return 0; }
+        prepare_ipv6_host || { warn "没有改动 docker 网络"; return 1; }
     else
-        warn "容器 IPv6 出网测试没通过。可查看：docker network inspect $NET ；ip6tables -t nat -S POSTROUTING"
+        note "切回 IPv4 模式会重建 docker 网络和面板容器（隧道若是容器网络模式也会重建），数据不受影响。"
+        ask_yn "继续? (y/N):" n || { info "已取消"; return 0; }
+    fi
+
+    NET_MODE="$new"
+    if ! rebuild_net; then
+        warn "切换失败，恢复为 ${cur/v/IPv} 模式"
+        NET_MODE="$cur"
+        rebuild_net || warn "恢复也没成功，请用菜单 10 查看日志，或再运行一次本菜单"
+        return 1
+    fi
+    save_state
+    wait_up 30 && ok "面板已重新启动" || warn "面板暂时没有响应，请查看日志"
+    if [ "$new" = "v6" ]; then
+        info "测试容器 IPv6 出网 ..."
+        if net_probe; then
+            ok "容器已能通过 IPv6 出网，可以试试在线更新 / 在线图标"
+        else
+            warn "容器 IPv6 出网测试没通过。可查看：docker network inspect $NET ；ip6tables -t nat -S POSTROUTING"
+        fi
+    else
+        ok "已切换为 IPv4 模式"
     fi
 }
 
@@ -951,7 +1037,7 @@ while true; do
     menu "  8) Cloudflare 隧道（配置 / 更新 / 移除）"
     menu "  9) 备份数据"
     menu " 10) 查看日志"
-    menu " 11) 让面板能联网（纯 IPv6 / NAT64 机器：在线更新、在线图标）"
+    menu " 11) 网络模式（IPv4 / IPv6 切换；纯 IPv6 / NAT64 机器选 IPv6）"
     menu "  0) 退出"
     [ -e "$SP_BIN" ] && note "  （快捷命令：在终端输入 sp 随时打开本菜单）"
     read -r -p "${G}请选择 [0-11]: ${R}" choice
@@ -966,7 +1052,7 @@ while true; do
         8) ( do_tunnel ) ;;
         9) ( do_backup ) ;;
         10) ( do_logs ) ;;
-        11) ( do_ipv6_net ) ;;
+        11) ( do_net_mode ) ;;
         0) echo "Bye."; exit 0 ;;
         *) warn "无效选项" ;;
     esac
