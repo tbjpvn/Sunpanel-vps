@@ -12,8 +12,6 @@ STATE_FILE="$DATA_DIR/.sunpanel-vps.env"
 TOKEN_FILE="$DATA_DIR/.cf-tunnel.env"
 LEGACY_CRON="${SUNPANEL_CRON_FILE:-/etc/cron.d/sunpanel-renew}"
 ROLLBACK_TAG="sun-panel-rollback:prev"
-SP_BIN="${SUNPANEL_SHORTCUT:-/usr/local/bin/sp}"
-SP_MARK="sunpanel-vps-shortcut-v1"
 IPV6_SYSCTL="/etc/sysctl.d/99-sunpanel-ipv6.conf"
 IPV6_SUBNET="fd7a:5e6c:3b1d::/64"
 MIRROR="${SUNPANEL_MIRROR:-}"
@@ -247,13 +245,13 @@ ask_bind() {
     fi
     container_running "$TUNNEL_NAME" && tunnel_on=1
     echo "监听方式："
-    echo "  1) 0.0.0.0    所有网卡，可用 http://服务器IP:端口 直接访问"
-    echo "  2) 127.0.0.1  仅本机"
+    echo "  1) 127.0.0.1  仅本机"
+    echo "  2) 0.0.0.0    所有网卡，可用 http://服务器IP:端口 直接访问"
     [ "$tunnel_on" -eq 1 ] && echo "  3) 不发布端口  只能通过 Cloudflare 隧道访问（最安全，推荐）"
     read -r -p "${G}请选择 [1]: ${R}" s
     case "${s:-1}" in
-        1) BIND="0.0.0.0" ;;
-        2) BIND="127.0.0.1" ;;
+        1) BIND="127.0.0.1" ;;
+        2) BIND="0.0.0.0" ;;
         3) [ "$tunnel_on" -eq 1 ] && BIND="none" || { warn "隧道没在运行（或隧道用宿主机网络模式，需要发布端口），不能选 3"; return 1; } ;;
         *) warn "无效选择"; return 1 ;;
     esac
@@ -311,27 +309,19 @@ apply_panel() {
     wait_up 30 && ok "${1:-已生效}" || warn "没有响应，请查看日志"
 }
 
-pack_data() {
-    local -a files=()
-    local d
-    for d in conf database uploads; do [ -e "$DATA_DIR/$d" ] && files+=("$d"); done
-    [ "${#files[@]}" -gt 0 ] || return 2
-    tar -czf "$1.tmp" -C "$DATA_DIR" "${files[@]}" && mv -f "$1.tmp" "$1" \
-        || { rm -f "$1.tmp"; return 1; }
-}
-
 backup_data() {
     BACKUP_FILE=""
     [ -d "$DATA_DIR" ] || return 0
-    local out="$HOME/sun-panel-backup.tar.gz"
-    pack_data "$out"
-    case $? in
-        0) rm -f "$HOME"/sun-panel-backup-*.tar.gz
-           BACKUP_FILE="$out"
-           ok "数据已备份（覆盖旧备份）: $BACKUP_FILE" ;;
-        2) return 0 ;;
-        *) warn "备份失败（旧备份保持不变）"; return 1 ;;
-    esac
+    local -a files=()
+    local d out="$HOME/sun-panel-backup.tar.gz"
+    for d in conf database uploads; do [ -e "$DATA_DIR/$d" ] && files+=("$d"); done
+    [ "${#files[@]}" -gt 0 ] || return 0
+    if tar -czf "$out.tmp" -C "$DATA_DIR" "${files[@]}" && mv -f "$out.tmp" "$out"; then
+        BACKUP_FILE="$out"
+        ok "数据已备份（覆盖旧备份）: $BACKUP_FILE"
+    else
+        rm -f "$out.tmp"; warn "备份失败（旧备份保持不变）"; return 1
+    fi
 }
 
 show_access() {
@@ -380,7 +370,7 @@ do_install() {
     save_state
     sync_panel_fw
 
-    wait_up 30 && ok "服务已正常响应" || warn "30 秒内没有响应，请用菜单 11 查看日志排查"
+    wait_up 30 && ok "服务已正常响应" || warn "30 秒内没有响应，请用菜单 10 查看日志排查"
     if [ "$NET_MODE" = "v6" ]; then
         net_probe && ok "容器 IPv6 出网正常（在线更新 / 在线图标可用）" \
             || warn "容器 IPv6 出网测试没通过，可到菜单 9 查看 / 重试"
@@ -463,7 +453,7 @@ do_version_update() {
         if run_panel "$ROLLBACK_TAG" && wait_up 30; then
             ok "已回滚，旧版本恢复运行"
         else
-            warn "回滚后仍无响应，请用菜单 11 查看日志；数据备份: ${BACKUP_FILE:-无}（可用菜单 10 恢复）"
+            warn "回滚后仍无响应，请用菜单 10 查看日志；数据备份: ${BACKUP_FILE:-无}"
         fi
         return 1
     fi
@@ -511,7 +501,7 @@ do_uninstall() {
     load_state
     local mode a n backups
     echo "卸载方式："
-    echo "  1) 保留数据：删容器/隧道/网络/防火墙规则，保留 $DATA_DIR 和备份，重装后账号数据还在"
+    echo "  1) 保留数据：删容器/隧道/网络/防火墙规则，保留 $DATA_DIR，重装后账号数据还在"
     echo "  2) 彻底清除：在 1 的基础上，再删镜像、数据目录（账号/导航数据/上传的图标）和脚本生成的所有文件"
     read -r -p "${G}请选择 [1]（其他键取消）: ${R}" mode
     mode="${mode:-1}"
@@ -526,10 +516,8 @@ do_uninstall() {
         warn "彻底清除后，面板里的账号、导航数据、上传的图标都无法恢复！"
         read -r -p "${G}确认请输入 yes: ${R}" a
         [ "$a" = "yes" ] || { echo "已取消"; return 0; }
-        if [ -d "$DATA_DIR" ] && ask_yn "清除前先备份一份数据到 $HOME ? (y/N):" n; then backup_data; fi
     else
         ask_yn "确认卸载? (y/N):" n || { echo "已取消"; return 0; }
-        if [ -d "$DATA_DIR" ] && ask_yn "卸载前再备份一份到 $HOME ? (y/N):" n; then backup_data; fi
     fi
 
     drm "$CNAME" "$TUNNEL_NAME"
@@ -547,7 +535,6 @@ do_uninstall() {
         ok "镜像已清理（仍被其他容器使用的会保留）"
         wipe_data_dir
         ok "数据目录已清除"
-        remove_shortcut
         backups="$(ls "$HOME"/sun-panel-backup*.tar.gz 2>/dev/null)"
         if [ -n "$backups" ]; then
             n="$(echo "$backups" | wc -l | tr -d ' ')"
@@ -562,7 +549,7 @@ do_uninstall() {
         fi
     else
         DOMAIN=""; TUNNEL_HOST=0; save_state
-        echo "数据目录保留在 $DATA_DIR；备份文件在 $HOME/sun-panel-backup.tar.gz"
+        echo "数据目录保留在 $DATA_DIR"
     fi
 
     note "脚本无法代劳的部分："
@@ -581,7 +568,7 @@ do_status() {
     if container_running "$CNAME" && alive; then echo "服务响应: 正常"; else echo "服务响应: 无响应"; fi
     if container_exists "$TUNNEL_NAME"; then
         docker ps -a --filter "name=^${TUNNEL_NAME}\$" --format '    {{.Names}}  {{.Status}}'
-        if tunnel_connected; then echo "隧道连接: 已连接 Cloudflare"; else echo "隧道连接: 未确认（请看菜单 11 的隧道日志）"; fi
+        if tunnel_connected; then echo "隧道连接: 已连接 Cloudflare"; else echo "隧道连接: 未确认（请看菜单 10 的隧道日志）"; fi
         echo "域名: ${DOMAIN:-未记录}"
     else
         echo "Cloudflare 隧道: 未配置"
@@ -678,19 +665,6 @@ do_tunnel_setup() {
     prep
     container_exists "$CNAME" || { warn "请先安装 Sun-Panel"; return 0; }
 
-    echo "先在 Cloudflare 后台为面板【新建一条专用隧道】（不要复用 sing-box 的 argo 隧道）："
-    echo "  1. 控制台左侧 Networking → Tunnels → Create a tunnel"
-    echo "     （旧版界面在 Zero Trust → Networks → Tunnels）"
-    echo "  2. 填名字（如 sunpanel）→ Create Tunnel，页面会给出一条安装命令，里面有 token（eyJ 开头的一长串）"
-    imp "     只需要复制这条命令（或 token），【不要】在服务器上运行它，粘贴到下面给脚本就行"
-    echo "  3. 脚本连上隧道后，回到该页面点 Continue；或者进入 Tunnels → 点你的隧道 → Routes 标签"
-    echo "     → Add route → Published application，填写："
-    echo "       子域名 + 域名：如 nav.example.com"
-    echo "       Service URL：  http://$CNAME:$CPORT"
-    echo "     （旧版界面：隧道的 Public Hostname 标签 → Add a public hostname，服务类型 HTTP，URL 填 $CNAME:$CPORT）"
-    echo "     DNS 记录没有自动创建的话，手动加一条 CNAME：名称=子域名，目标=<隧道ID>.cfargotunnel.com，开启代理"
-    note "  ※ 纯 IPv6 / NAT64 的机器请先到菜单 9 切换为 IPv6 模式，隧道才连得上 Cloudflare"
-    echo
     local raw token h
     read -r -p "${G}粘贴隧道 token（回车取消）: ${R}" raw
     [ -n "$raw" ] || { echo "已取消"; return 0; }
@@ -806,83 +780,6 @@ do_tunnel() {
     esac
 }
 
-restore_data() {
-    need_root
-    local -a arr
-    local f i pick src bad list prerestore="$HOME/sun-panel-backup.prerestore.tar.gz"
-    mapfile -t arr < <(ls -t "$HOME"/sun-panel-backup.tar.gz "$HOME"/sun-panel-backup-*.tar.gz 2>/dev/null)
-
-    echo "可用的备份："
-    i=1
-    for f in "${arr[@]}"; do
-        menu "  $i) $f   ($(du -h "$f" | cut -f1), $(date -r "$f" '+%F %T'))"
-        i=$((i + 1))
-    done
-    menu "  p) 指定其他备份文件路径（比如从别的服务器传过来的 .tar.gz）"
-    [ "${#arr[@]}" -eq 0 ] && note "  （$HOME 下没有找到本脚本生成的备份）"
-    read -r -p "${G}请选择（回车取消）: ${R}" pick
-    case "$pick" in
-        '') echo "已取消"; return 0 ;;
-        p|P) read -r -p "${G}备份文件完整路径: ${R}" src; [ -n "$src" ] || { echo "已取消"; return 0; } ;;
-        *[!0-9]*) warn "无效选择"; return 1 ;;
-        *) [ "$pick" -ge 1 ] && [ "$pick" -le "${#arr[@]}" ] || { warn "无效选择"; return 1; }
-           src="${arr[$((pick - 1))]}" ;;
-    esac
-    [ -f "$src" ] || { warn "找不到文件：$src"; return 1; }
-
-    list="$(tar -tzf "$src" 2>/dev/null)" || { warn "不是有效的 tar.gz 备份文件"; return 1; }
-    bad="$(grep -Ev '^(\./)?(conf|database|uploads)(/|$)' <<<"$list" | head -n1)"
-    [ -z "$bad" ] || { warn "备份内容不符合预期（出现：$bad），已拒绝恢复"; return 1; }
-    grep -Eq '(^|/)\.\.(/|$)' <<<"$list" && { warn "备份里含有不安全的路径，已拒绝恢复"; return 1; }
-
-    imp "恢复会用备份覆盖当前面板数据（账号、书签、上传文件等）。"
-    note "当前数据会先另存为 $prerestore（只保留最近一次）。"
-    note "备份里没有的内容：隧道 token、端口 / 监听方式 / 网络模式。需要的话恢复后到菜单 8 / 7 / 9 重新设置。"
-    ask_yn "确认恢复? (y/N):" n || { echo "已取消"; return 0; }
-
-    mkdir -p "$DATA_DIR"
-    pack_data "$prerestore"
-    case $? in
-        0) ok "当前数据已另存: $prerestore" ;;
-        2) ;;
-        *) warn "无法另存当前数据，已中止（没有改动任何数据）"; return 1 ;;
-    esac
-
-    container_exists "$CNAME" && docker stop "$CNAME" >/dev/null 2>&1
-    rm -rf "$DATA_DIR/conf" "$DATA_DIR/database" "$DATA_DIR/uploads"
-    if ! tar -xzf "$src" -C "$DATA_DIR"; then
-        warn "解压失败"
-        if [ -f "$prerestore" ]; then
-            tar -xzf "$prerestore" -C "$DATA_DIR" && ok "已还原为恢复前的数据"
-        fi
-        container_exists "$CNAME" && docker start "$CNAME" >/dev/null 2>&1
-        return 1
-    fi
-    ok "数据已恢复"
-
-    if container_exists "$CNAME"; then
-        docker restart "$CNAME" >/dev/null 2>&1
-        wait_up 30 && ok "面板已重启，请用恢复后的账号登录" || warn "面板暂时没有响应，请用菜单 11 查看日志"
-    else
-        note "还没有安装面板：请先用菜单 1 安装，安装后会直接使用这份数据。"
-    fi
-}
-
-do_backup() {
-    need_root
-    echo "------------- 备份与恢复 -------------"
-    menu "  1) 备份数据（覆盖 $HOME/sun-panel-backup.tar.gz）"
-    menu "  2) 恢复数据（重装后用）"
-    local c
-    read -r -p "${G}请选择（回车取消）: ${R}" c
-    case "$c" in
-        1) [ -d "$DATA_DIR" ] || { warn "没有数据目录"; return 0; }; backup_data ;;
-        2) restore_data ;;
-        '') echo "已取消" ;;
-        *) warn "无效选择" ;;
-    esac
-}
-
 do_logs() {
     has docker || { warn "没有安装 Docker"; return 0; }
     local t
@@ -993,7 +890,7 @@ do_net_mode() {
     if ! rebuild_net; then
         warn "切换失败，恢复为 ${cur/v/IPv} 模式"
         NET_MODE="$cur"
-        rebuild_net || warn "恢复也没成功，请用菜单 11 查看日志，或再运行一次本菜单"
+        rebuild_net || warn "恢复也没成功，请用菜单 10 查看日志，或再运行一次本菜单"
         return 1
     fi
     save_state
@@ -1010,30 +907,6 @@ do_net_mode() {
     fi
 }
 
-install_shortcut() {
-    [ "$(id -u)" -eq 0 ] || return 0
-    local self="${BASH_SOURCE[0]:-$0}"
-    [ -f "$self" ] && [ -r "$self" ] || return 0
-    if [ -e "$SP_BIN" ] && ! grep -q "$SP_MARK" "$SP_BIN" 2>/dev/null; then
-        warn "$SP_BIN 已存在且不是本脚本安装的，跳过快捷命令 sp"
-        return 0
-    fi
-    [ -e "$SP_BIN" ] && cmp -s "$self" "$SP_BIN" && return 0
-    mkdir -p "$(dirname "$SP_BIN")" 2>/dev/null
-    if cp -f "$self" "$SP_BIN" 2>/dev/null && chmod 755 "$SP_BIN"; then
-        ok "已安装快捷命令：以后在终端输入 sp 即可打开本菜单"
-    else
-        warn "快捷命令安装失败（不影响使用）"
-    fi
-}
-
-remove_shortcut() {
-    [ -e "$SP_BIN" ] && grep -q "$SP_MARK" "$SP_BIN" 2>/dev/null && rm -f "$SP_BIN" && ok "已删除快捷命令 sp"
-    return 0
-}
-
-install_shortcut
-
 while true; do
     echo
     menu "=========================================="
@@ -1048,11 +921,9 @@ while true; do
     menu "  7) 修改端口/监听方式"
     menu "  8) CF隧道管理"
     menu "  9) 网络模式切换"
-    menu " 10) 备份与恢复"
-    menu " 11) 查看日志"
+    menu " 10) 查看日志"
     menu_purple "  0) 退出"
-    [ -e "$SP_BIN" ] && note "  （快捷命令：在终端输入 sp 随时打开本菜单）"
-    read -r -p "${G}请选择 [0-11]: ${R}" choice
+    read -r -p "${G}请选择 [0-10]: ${R}" choice
     case "$choice" in
         1) ( do_install ) ;;
         2) ( do_version_update ) ;;
@@ -1063,8 +934,7 @@ while true; do
         7) ( do_port ) ;;
         8) ( do_tunnel ) ;;
         9) ( do_net_mode ) ;;
-        10) ( do_backup ) ;;
-        11) ( do_logs ) ;;
+        10) ( do_logs ) ;;
         0) echo "Bye."; exit 0 ;;
         *) warn "无效选项" ;;
     esac
