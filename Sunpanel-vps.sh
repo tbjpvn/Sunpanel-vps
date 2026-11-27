@@ -114,7 +114,9 @@ public_ip() {
 }
 
 alive() {
-    docker exec "$CNAME" wget -q -O /dev/null -T 3 "http://127.0.0.1:$CPORT/" >/dev/null 2>&1
+    # v2.x 对不带 Accept: text/html 的请求返回 404，所以带上浏览器头，并且只要有 HTTP 响应就算存活
+    docker exec "$CNAME" wget -S --header="Accept: text/html" -O /dev/null -T 3 \
+        "http://127.0.0.1:$CPORT/" 2>&1 | grep -q 'HTTP/'
 }
 
 wait_up() {
